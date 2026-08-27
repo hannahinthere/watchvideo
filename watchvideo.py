@@ -319,22 +319,59 @@ def _grid(n, w, h, target=1560, budget=1568):
         rows = -(-n // c)
         tw, th = c * cell, rows * cell * ar
         eff = cell * min(1.0, budget / max(tw, th))
-        score = (c * rows - n, -eff)
+        # 先看清楚，再谈整齐：空格数最多也就 cols-1 个（最后一行缺几格），
+        # 而把"零空格"设成绝对优先会让质数格数塌成 1 列——17 格排成 1×17、
+        # 每格只剩 164px。宁可最后一行空两格。
+        score = (-eff, c * rows - n)
         if best is None or score < best[0]:
             best = (score, c, cell, rows)
     return best[1], best[2], best[3]
 
 
-def _auto_grids(dur):
-    """格数按时长走。短片就是没那么多信息——20 秒的单镜头视频给 12 格，
-    后面几格必然是同一个动作的复读，再好的选帧也变不出新东西。"""
+MAX_CELLS = 40
+
+
+MIN_CELL_PX = 350
+
+
+def _eff_px(n, w, h, budget=1568):
+    """一格在模型眼前的实际像素——样片超出 budget 会被整体缩掉，缩完才算数。"""
+    cols, cell, rows = _grid(n, w, h)
+    return cell * min(1.0, budget / max(cols * cell, rows * cell * h / w))
+
+
+def _page_size(w, h):
+    """一页放几格。格子太小就只能看出"有什么"、看不出"是什么"，宁可多出一张。
+
+    实测每格的实际像素：横屏 16~28 格都稳定在 390px，32 格掉到 348，35 格以上只剩
+    312；竖屏格子占地更高，16 格就掉到 220。所以按缩放后的像素卡，而不是按格数——
+    同样 20 格，横屏 390px、竖屏只有 220px。
+    """
+    for n in range(MAX_CELLS, 5, -1):
+        if _eff_px(n, w, h) >= MIN_CELL_PX:
+            return n
+    return 6
+
+
+def _auto_grids(dur, n_cuts=0):
+    """格数按时长打底，镜头密的片子按镜头数给够。
+
+    只看时长会漏掉一大半：一条 172 秒的预告片有 35 个镜头，按时长只给 12 格，
+    结果连出品方 logo 那一格都没抽到（黑场抽到了，logo 亮起的下一格没抽到），
+    骑乘、沼泽、熔岩、深海全不见。反过来 20 秒的单镜头视频给 12 格也是浪费，
+    后几格必然是同一个动作的复读。所以两者取大。
+
+    上限 MAX_CELLS：再多每格就掉到 200px 出头，看不清了。
+    """
     if dur <= 15:
-        return 6
-    if dur <= 45:
-        return 8
-    if dur <= 180:
-        return 12
-    return 16
+        base = 6
+    elif dur <= 45:
+        base = 8
+    elif dur <= 180:
+        base = 12
+    else:
+        base = 16
+    return max(base, min(n_cuts, MAX_CELLS)) if n_cuts else base
 
 
 def _drop_dupes(made, keep):
@@ -357,10 +394,11 @@ def _drop_dupes(made, keep):
             except (ValueError, IndexError):
                 pass
         kept.append((t, q))
-    if len(kept) <= keep:
-        return kept
-    idx = [round(i * (len(kept) - 1) / (keep - 1)) for i in range(keep)]
-    return [kept[i] for i in sorted(set(idx))]
+    n_kept = len(kept)
+    if n_kept <= keep:
+        return kept, n_kept
+    idx = [round(i * (n_kept - 1) / (keep - 1)) for i in range(keep)]
+    return [kept[i] for i in sorted(set(idx))], n_kept
 
 
 def _fetch_video(url, tmp, browser):
@@ -461,8 +499,9 @@ def contact_sheet(url, outdir, n_frames, browser):
         video = _fetch_video(url, tmp, browser)
 
         w, h, dur = _probe(video)
-        want = n_frames if n_frames > 0 else _auto_grids(dur)
-        times = _pick_times(_scene_cuts(video), dur, want * 2)
+        cuts = _scene_cuts(video)
+        want = n_frames if n_frames > 0 else _auto_grids(dur, len(cuts))
+        times = _pick_times(cuts, dur, want * 2)
 
         # 每格宽度按版式反推，让样片长边落在 ~1560px：再大模型也会缩掉
         cell = ((1560 // (4 if w >= h else 6)) & ~1)   # 候选帧先按保守宽度抽
@@ -481,16 +520,32 @@ def contact_sheet(url, outdir, n_frames, browser):
         # 按真实时间排序，不靠文件名字母序：超过 10 分钟后 "10m12s" 会排到
         # "1m57s" 前面，样片的时间线就乱了（补零也只是把问题推到 100 分钟）
         made = [(t, q) for t, q in sorted(made, key=lambda x: x[0]) if q.exists()]
-        shots = _drop_dupes(made, want)
+        n_cand = len(made)
+        shots, n_uniq = _drop_dupes(made, want)
         if not shots:
             sys.exit('一帧都没抽出来')
-        cols, cell, rows = _grid(len(shots), w, h)
         title = re.sub(r'[/:\\]', '_', video.stem)
-        dest = outdir / f'{title}.sheet.jpg'
-        # 标签跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
-        _montage([(_label(t, dur), q) for t, q in shots], cols, rows, cell, dest)
         mins = f'{int(dur) // 60}:{int(dur) % 60:02d}'
-        print(f'  -> {dest.name}  ({len(shots)} 格 / {cols}×{rows}，全片 {mins}）')
+        # 没检出切点不是出错，是这片子本来就一个镜头拍到底
+        shot_note = f'{len(cuts)} 个镜头' if cuts else '单镜头'
+        print(f'  {title}  全片 {mins}，{shot_note}，'
+              f'候选 {n_cand} → 去重剩 {n_uniq} → 取 {len(shots)}')
+
+        # 格子太小就读不出材质，超了宁可多出一张
+        per_page = _page_size(w, h)
+        n_pages = -(-len(shots) // per_page)
+        chunk = -(-len(shots) // n_pages)   # 均分，免得最后一页只剩两三格
+        for i in range(n_pages):
+            page = shots[i * chunk:(i + 1) * chunk]
+            if not page:
+                break
+            cols, cell, rows = _grid(len(page), w, h)
+            suffix = '' if n_pages == 1 else f'-{i + 1}'
+            dest = outdir / f'{title}.sheet{suffix}.jpg'
+            # 标签跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
+            _montage([(_label(t, dur), q) for t, q in page], cols, rows, cell, dest)
+            print(f'  -> {dest.name}  ({len(page)} 格 / {cols}×{rows}，'
+                  f'每格 {_eff_px(len(page), w, h):.0f}px)')
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

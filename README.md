@@ -89,15 +89,46 @@ tell you where to look; they are not enough to conclude what you saw.*
 
 ## 关于格数 / On the number of cells
 
-格数按时长自动定（≤15s→6，≤45s→8，≤3min→12，更长→16），`-F N` 可以显式指定。
+格数按时长打底（≤15s→6，≤45s→8，≤3min→12，更长→16），**再按实际镜头数取大**，
+上限 40 格；`-F N` 可以显式指定。
 
-*Cell count follows duration (≤15s→6, ≤45s→8, ≤3min→12, longer→16); `-F N` overrides.*
+*Cell count starts from duration (≤15s→6, ≤45s→8, ≤3min→12, longer→16), then takes
+**whichever is larger: that, or the number of detected shots**, capped at 40.*
+
+只看时长会漏掉一大半。一条 172 秒的预告片有 35 个镜头，按时长只给 12 格——出品方
+logo 那一格就没抽到（黑场抽到了，logo 亮起的下一格没有），骑乘、沼泽、深海全不见。
+反过来 20 秒的单镜头视频给 12 格纯属浪费。两者取大才对。
+
+*Duration alone misses most of it: a 172-second trailer holds 35 shots, and 12 cells
+skipped the publisher's logo entirely — along with whole biomes. Meanwhile a 20-second
+single-shot clip does not need 12.*
+
+格数多到一张放不下时会**自动分成多张**（`.sheet-1.jpg`、`.sheet-2.jpg`），每格保证
+不小于 350px。一张 40 格的样片缩放后每格只剩 229px，那个尺寸能看出"有什么"、
+看不出"是什么"；分成两张之后每格 390~464px，翻了一倍。按像素卡而不是按格数，
+是因为同样 20 格横屏有 390px、竖屏只剩 220px。
+
+*When the cells no longer fit on one image it **splits into several**
+(`.sheet-1.jpg`, `.sheet-2.jpg`), keeping every cell at 350px or more. A single 40-cell
+sheet shrinks to 229px per cell — enough to see that something is there, not enough to
+tell what it is. Split in two, each cell is 390–464px. The threshold is in pixels rather
+than cell count because the same 20 cells give 390px landscape but only 220px portrait.*
 
 **别指望用帧间差异去重来解决冗余。** 拿真实样本量过：一条水面拍摄的海獭视频（20 秒
 单镜头，冗余最重）和一条室内固定机位的水獭视频，归一化 RMSE 中位数分别是 0.176 和
 0.094——冗余最重的那条反而全程更高，因为波光让每帧像素差都很大。换感知哈希 PHASH，
 两条几乎重合（2.01 vs 2.30）。像素和感知距离只能回答"画面变了没有"，回答不了
 "意思重复了没有"。所以去重只用来清掉肉眼全等的帧，真正控制冗余的是格数。
+
+实测这个分工很清楚：快切的预告片候选 70 帧、去重后剩 56（清掉两成，都是同一镜头
+被抽到两次）；而单镜头的水獭视频候选 12 帧、**一帧都去不掉**——它确实一直在动，
+只是动作语义重复。去重管"抽重了"，格数管"这片子本来就没那么多信息"。
+
+*The division of labour is measurable: on a fast-cut trailer 70 candidates dedupe down to
+56 (a fifth removed, all of them the same shot sampled twice); on a single-shot otter clip
+12 candidates dedupe to **12 — nothing removed at all**. The otter really is moving the
+whole time; only the meaning repeats. Dedup handles double-sampling, cell count handles
+clips that simply hold less.*
 
 ***Do not expect frame-difference dedup to solve redundancy.*** *Measured on real samples:
 a sea otter filmed on water (20s, single shot, the most redundant clip) versus an otter
