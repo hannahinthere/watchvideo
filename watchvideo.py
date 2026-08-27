@@ -3,6 +3,7 @@
 
     watchvideo <url>                    # 抓字幕，默认 txt
     watchvideo <url> -F                 # 印相样片，格数按时长自动定
+    watchvideo <url> -z 2:15            # 把某个时间点抽成大图看清楚
     watchvideo <url> -F 20              # 显式给格数
     watchvideo <url> --list             # 先看有哪些字幕轨
     watchvideo <url> -l en -f srt        # 指定语种 / 要时间轴
@@ -362,6 +363,94 @@ def _drop_dupes(made, keep):
     return [kept[i] for i in sorted(set(idx))]
 
 
+def _fetch_video(url, tmp, browser):
+    """下载视频到 tmp 并返回路径。只在这里处理站点差异，别在调用处各写一遍。"""
+    order = ['none', browser] if re.search(ANON_FIRST, url) else [browser, 'none']
+    err = ['']
+    for b in dict.fromkeys(order):
+        cmd = ['yt-dlp', '-f', FMT, '--no-playlist',
+               '-o', str(tmp / '%(title)s.%(ext)s')]
+        if b != 'none':
+            cmd += ['--cookies-from-browser', b]
+        r = subprocess.run(cmd + [url], capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+        err = (r.stderr or '').strip().splitlines()[-1:] or ['']
+    else:
+        sys.exit(f'视频下载失败：{err[0][:200]}')
+
+    vids = [f for f in tmp.iterdir()
+            if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.mov', '.flv')]
+    if not vids:
+        sys.exit('下载完成但没找到视频文件')
+    return max(vids, key=lambda f: f.stat().st_size)
+
+
+def _parse_time(text):
+    """'135' / '2:15' / '1:02:03' -> 秒"""
+    try:
+        parts = [float(x) for x in text.strip().split(':')]
+    except ValueError:
+        sys.exit(f'看不懂的时间点: {text}')
+    return sum(p * 60 ** i for i, p in enumerate(reversed(parts)))
+
+
+def _label(t, dur):
+    return f'{t:.1f}s' if dur < 60 else f'{int(t) // 60:d}:{int(t) % 60:02d}'
+
+
+def _montage(tiles, cols, rows, cell, dest):
+    args = []
+    for lab, path in tiles:
+        args += ['-label', lab, str(path)]
+    font = _font()
+    subprocess.run(['montage', *(['-font', font] if font else []),
+                    '-background', '#1b1b1b', '-fill', '#f0f0f0',
+                    '-pointsize', '16', '-tile', f'{cols}x{rows}',
+                    '-geometry', f'{cell}x+5+5', *args, str(dest)], check=True)
+
+
+def zoom(url, outdir, spec, browser):
+    """把指定时间点抽成大图——样片挑出可疑的格子之后用这个看清楚。"""
+    for exe in ('ffmpeg', 'ffprobe', 'montage'):
+        if not shutil.which(exe):
+            sys.exit(f'缺 {exe}（montage 来自 imagemagick: brew install imagemagick）')
+
+    times = [_parse_time(x) for x in spec.split(',') if x.strip()]
+    if not times:
+        sys.exit('没给时间点，例如 -z 2:15 或 -z 2:11,2:13,2:15')
+
+    tmp = Path(tempfile.mkdtemp(prefix='zoom-'))
+    try:
+        video = _fetch_video(url, tmp, browser)
+        w, h, dur = _probe(video)
+        over = [t for t in times if t > dur]
+        if over:
+            sys.exit(f'时间点超出片长（{int(dur) // 60}:{int(dur) % 60:02d}）: '
+                     + ', '.join(f'{t:g}s' for t in over))
+
+        # 单帧就给足分辨率；多帧仍按缩放后的有效大小排版
+        cols, cell, rows = (1, 1400, 1) if len(times) == 1 else _grid(len(times), w, h)
+        tiles = []
+        for i, t in enumerate(sorted(times)):
+            out = tmp / f'{i:03d}.jpg'
+            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-ss', str(t), '-i', str(video),
+                            '-frames:v', '1', '-vf', f'scale={cell}:-2', str(out)], check=False)
+            if out.exists():
+                tiles.append((_label(t, dur), out))
+        if not tiles:
+            sys.exit('一帧都没抽出来')
+
+        first = f'{int(times[0]) // 60:02d}m{int(times[0]) % 60:02d}s'
+        name = first if len(tiles) == 1 else f'{first}+{len(tiles) - 1}'
+        dest = outdir / f'{re.sub(r"[/:\\]", "_", video.stem)[:70]}.zoom-{name}.jpg'
+        _montage(tiles, cols, rows, cell, dest)
+        print(f'  -> {dest.name}  ({len(tiles)} 帧 / {cols}×{rows}，每格 {cell}px)')
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def contact_sheet(url, outdir, n_frames, browser):
     for exe in ('ffmpeg', 'ffprobe', 'montage'):
         if not shutil.which(exe):
@@ -369,24 +458,7 @@ def contact_sheet(url, outdir, n_frames, browser):
 
     tmp = Path(tempfile.mkdtemp(prefix='sheet-'))
     try:
-        order = ['none', browser] if re.search(ANON_FIRST, url) else [browser, 'none']
-        err = ''
-        for b in dict.fromkeys(order):
-            cmd = ['yt-dlp', '-f', FMT, '--no-playlist',
-                   '-o', str(tmp / '%(title)s.%(ext)s')]
-            if b != 'none':
-                cmd += ['--cookies-from-browser', b]
-            r = subprocess.run(cmd + [url], capture_output=True, text=True)
-            if r.returncode == 0:
-                break
-            err = (r.stderr or '').strip().splitlines()[-1:] or ['']
-        else:
-            sys.exit(f'视频下载失败：{err[0][:200]}')
-        vids = [f for f in tmp.iterdir()
-                if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.mov', '.flv')]
-        if not vids:
-            sys.exit('下载完成但没找到视频文件')
-        video = max(vids, key=lambda f: f.stat().st_size)
+        video = _fetch_video(url, tmp, browser)
 
         w, h, dur = _probe(video)
         want = n_frames if n_frames > 0 else _auto_grids(dur)
@@ -415,17 +487,8 @@ def contact_sheet(url, outdir, n_frames, browser):
         cols, cell, rows = _grid(len(shots), w, h)
         title = re.sub(r'[/:\\]', '_', video.stem)
         dest = outdir / f'{title}.sheet.jpg'
-        # 标签逐个指定，跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
-        tiles = []
-        for t, q in shots:
-            lab = f'{t:.1f}s' if dur < 60 else f'{int(t) // 60:d}:{int(t) % 60:02d}'
-            tiles += ['-label', lab, str(q)]
-        font = _font()
-        subprocess.run(['montage', *(['-font', font] if font else []),
-                        '-background', '#1b1b1b', '-fill', '#f0f0f0',
-                        '-pointsize', '16', '-tile', f'{cols}x{rows}',
-                        '-geometry', f'{cell}x+5+5',
-                        *tiles, str(dest)], check=True)
+        # 标签跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
+        _montage([(_label(t, dur), q) for t, q in shots], cols, rows, cell, dest)
         mins = f'{int(dur) // 60}:{int(dur) % 60:02d}'
         print(f'  -> {dest.name}  ({len(shots)} 格 / {cols}×{rows}，全片 {mins}）')
         return 0
@@ -445,15 +508,19 @@ def main():
     p.add_argument('--list', action='store_true')
     p.add_argument('-F', '--frames', nargs='?', type=int, const=0, default=None,
                    metavar='N', help='拼印相样片，不抓字幕；N 省略则按时长自动定格数')
+    p.add_argument('-z', '--zoom', metavar='T[,T...]',
+                   help='把指定时间点抽成大图，如 -z 2:15 或 -z 2:11,2:13,2:15')
     a = p.parse_args()
 
     outdir = Path(a.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
-    if a.frames is not None:   # 0 = 按时长自动定格数，不能用真值判断
+    if a.frames is not None or a.zoom:   # 0 = 自动格数，不能用真值判断 a.frames
         url = a.url
         if 'xhslink' in url:   # 短链不展开的话 xsec_token 会丢
             req = urllib.request.Request(url, headers={'User-Agent': UA})
             url = urllib.request.urlopen(req, timeout=30).geturl()
+        if a.zoom:
+            return zoom(url, outdir, a.zoom, a.browser)
         return contact_sheet(url, outdir, a.frames, a.browser)
 
     handler = xiaohongshu if re.search(r'xiaohongshu\.com|xhslink', a.url) else generic

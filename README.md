@@ -13,17 +13,12 @@ watchvideo <url> --list     # 先看有哪些字幕轨        list available tra
 
 ## 长什么样 / What it looks like
 
-一条 2:33 的电影幕后（12 格，每格 520px，烧录的中文字幕清晰可读）：
+一条 2:52 的游戏预告片，12 格排成 3×4，每格 520px——烧录字幕和角色细节都还读得出：
 
-*A 2:33 behind-the-scenes clip — 12 cells at 520px each; the burned-in captions stay legible:*
+*A 2:52 game trailer as 12 cells in a 3×4 grid, 520px each — burned-in captions and
+character detail both survive:*
 
-![contact sheet of a 2:33 clip, 12 cells in a 3x4 grid with timestamps](docs/example-odyssey.jpg)
-
-一条 11 秒的短视频（6 格——短片就是没那么多信息，格子少了每格才大）：
-
-*An 11-second clip — 6 cells. Short clips simply do not hold more; fewer cells means each one is bigger:*
-
-![contact sheet of an 11-second clip, 6 cells in a 3x2 grid](docs/example-otter.jpg)
+![contact sheet of a 2:52 trailer, 12 cells in a 3x4 grid with timestamps](docs/example-sheet.jpg)
 
 ## 为什么不直接用 yt-dlp / Why not just yt-dlp
 
@@ -65,6 +60,33 @@ N isolated images carry no temporal relationship, and attention decays across th
 *Tiled into one grid with a timestamp under each cell, nothing can be skipped and the
 timeline is visible at a glance. Zoom into a single cell by timestamp when you need detail.*
 
+## 先总览，再放大 / Survey first, then zoom
+
+样片是用来**定位**的，不是用来看细节的。挑出可疑的格子之后，用 `-z` 按时间戳把
+那一瞬间抽成大图（单帧给到 1400px）。
+
+*The sheet is for **locating**, not for detail. Once a cell looks interesting, `-z`
+pulls that exact moment out at full size (1400px for a single frame).*
+
+```bash
+watchvideo <url> -F          # 哪一格可疑？        which cell looks interesting?
+watchvideo <url> -z 2:15     # 把它抽出来看清楚     pull it out and look properly
+```
+
+这个工作流是有实际代价的教训。上面那张样片里 2:13 那格，看着像"持剑者与跪着的人
+对峙"。放大之后：
+
+*This workflow came from getting it wrong. In the sheet above, the cell at 2:13 looked
+like "a swordsman facing someone kneeling". Zoomed in:*
+
+![the same moment at full size, showing five characters fighting across a field](docs/example-zoom.jpg)
+
+五个角色各打各的位——那不是对峙，是多人同屏。缩略图能告诉你哪里值得看，
+但不足以让你断定看到了什么。
+
+*Five characters spread across the field — not a standoff, a co-op party. Thumbnails
+tell you where to look; they are not enough to conclude what you saw.*
+
 ## 关于格数 / On the number of cells
 
 格数按时长自动定（≤15s→6，≤45s→8，≤3min→12，更长→16），`-F N` 可以显式指定。
@@ -103,6 +125,8 @@ watchvideo <url> -f srt            # 要时间轴              keep timestamps
 watchvideo <url> -l zh-CN          # 指定语种              pick a language
 watchvideo <url> -F                # 印相样片              contact sheet
 watchvideo <url> -F 20             # 显式给格数            explicit cell count
+watchvideo <url> -z 2:15           # 放大某个时间点        zoom into one moment
+watchvideo <url> -z 2:11,2:13,2:15 # 放大多个时间点        several moments
 watchvideo <url> -o DIR            # 输出目录              output directory
 watchvideo <url> --browser chrome  # 借浏览器 cookie       borrow browser cookies
 ```
