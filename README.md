@@ -1,0 +1,157 @@
+# watchvideo
+
+把一条视频变成模型能读的东西：**字幕**，或者**一张印相样片**。不留视频文件。
+
+*Turn a video into something a model can actually read: **subtitles**, or a single
+**contact sheet**. No video file is kept.*
+
+```bash
+watchvideo <url>            # 抓字幕，默认纯文本      subtitles, plain text
+watchvideo <url> -F         # 拼一张印相样片          one contact sheet
+watchvideo <url> --list     # 先看有哪些字幕轨        list available tracks
+```
+
+## 长什么样 / What it looks like
+
+一条 2:33 的电影幕后（12 格，每格 520px，烧录的中文字幕清晰可读）：
+
+*A 2:33 behind-the-scenes clip — 12 cells at 520px each; the burned-in captions stay legible:*
+
+![contact sheet of a 2:33 clip, 12 cells in a 3x4 grid with timestamps](docs/example-odyssey.jpg)
+
+一条 11 秒的短视频（6 格——短片就是没那么多信息，格子少了每格才大）：
+
+*An 11-second clip — 6 cells. Short clips simply do not hold more; fewer cells means each one is bigger:*
+
+![contact sheet of an 11-second clip, 6 cells in a 3x2 grid](docs/example-otter.jpg)
+
+## 为什么不直接用 yt-dlp / Why not just yt-dlp
+
+小红书（RedNote）的视频带真的 srt 字幕轨（`sns-subtitle-s2.xhscdn.com`，常见
+`zh-CN` / `en-US` / `source` 三条），但 yt-dlp 的 `xiaohongshu.py` 里**一行字幕代码都没有**，
+只会回一句 `has no subtitles`。那不是"站上没有"，是"工具没做"。这里自己从页面 JSON 解析。
+
+*Xiaohongshu (RedNote) videos do carry real srt subtitle tracks, but yt-dlp's
+`xiaohongshu.py` contains **no subtitle code at all** — it just says
+`has no subtitles`. That is not evidence the site lacks them; it means the
+extractor never implemented them. This tool parses them out of the page JSON.*
+
+两个坑：小红书**必须匿名抓**——带登录 cookie 时它返回的是另一套残缺页面，既没有字幕块
+也没有可下载的 video format；解析时只还原 `/`、`&`、`\"` 三种转义，别整篇
+`unicode_escape`，那会毁掉中文。
+
+*Two traps: you **must fetch anonymously** — with login cookies the site returns a
+different, stripped-down page carrying neither subtitles nor any downloadable video
+format. And unescape only `/`, `&` and `\"`; a blanket `unicode_escape` will destroy CJK text.*
+
+## 为什么样片要拼成一张 / Why one sheet instead of N images
+
+因为逐张递图给模型，模型会**跳着看**。
+
+*Because when you hand a model N separate images, it **skips some of them**.*
+
+这个工具的起因是一次失败：23 帧逐张读进去，模型自己挑着看、跳过了其中 5 张，而唯一能
+认出画面里那个人是谁的关键帧，正在被跳过的那几张里。抽帧质量没问题，问题在呈现——
+N 张孤立的图片没有时序关系，注意力还会随张数衰减。
+
+*This tool started from a failure: 23 frames were read in one by one, the model picked
+which ones to look at, skipped 5 of them — and the only frame that identified the person
+on screen was among the skipped ones. The extraction was fine; the presentation was not.
+N isolated images carry no temporal relationship, and attention decays across them.*
+
+拼成一张网格、每格标时间戳，模型没法跳帧，还能一眼看到时间线。需要细节时再按时间戳
+单独放大那一格。
+
+*Tiled into one grid with a timestamp under each cell, nothing can be skipped and the
+timeline is visible at a glance. Zoom into a single cell by timestamp when you need detail.*
+
+## 关于格数 / On the number of cells
+
+格数按时长自动定（≤15s→6，≤45s→8，≤3min→12，更长→16），`-F N` 可以显式指定。
+
+*Cell count follows duration (≤15s→6, ≤45s→8, ≤3min→12, longer→16); `-F N` overrides.*
+
+**别指望用帧间差异去重来解决冗余。** 拿真实样本量过：一条水面拍摄的海獭视频（20 秒
+单镜头，冗余最重）和一条室内固定机位的水獭视频，归一化 RMSE 中位数分别是 0.176 和
+0.094——冗余最重的那条反而全程更高，因为波光让每帧像素差都很大。换感知哈希 PHASH，
+两条几乎重合（2.01 vs 2.30）。像素和感知距离只能回答"画面变了没有"，回答不了
+"意思重复了没有"。所以去重只用来清掉肉眼全等的帧，真正控制冗余的是格数。
+
+***Do not expect frame-difference dedup to solve redundancy.*** *Measured on real samples:
+a sea otter filmed on water (20s, single shot, the most redundant clip) versus an otter
+indoors on a fixed camera — median normalised RMSE 0.176 vs 0.094. The **most** redundant
+clip scores **higher** throughout, because rippling water keeps every pixel delta large.
+Perceptual hashing barely separates them either (median PHASH 2.01 vs 2.30). Pixel and
+perceptual distance answer "did the picture change", not "did the meaning repeat".
+So dedup only removes visually identical frames; cell count is what actually controls redundancy.*
+
+## 安装 / Install
+
+```bash
+brew install yt-dlp ffmpeg imagemagick     # macOS
+```
+
+Linux 用各自的包管理器装这三个即可。把 `watchvideo.py` 放进 PATH（或做个软链）。
+
+*On Linux install the same three via your package manager. Put `watchvideo.py` on your PATH.*
+
+## 用法 / Usage
+
+```bash
+watchvideo <url>                   # 字幕，纯文本（默认）  subtitles, plain text
+watchvideo <url> -f srt            # 要时间轴              keep timestamps
+watchvideo <url> -l zh-CN          # 指定语种              pick a language
+watchvideo <url> -F                # 印相样片              contact sheet
+watchvideo <url> -F 20             # 显式给格数            explicit cell count
+watchvideo <url> -o DIR            # 输出目录              output directory
+watchvideo <url> --browser chrome  # 借浏览器 cookie       borrow browser cookies
+```
+
+环境变量 `WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` 可以省掉每次输入。
+
+*`WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` set your defaults.*
+
+## 站点 / Sites
+
+样片对 yt-dlp 支持的站点通用；字幕除小红书外也走 yt-dlp。实测过 B 站、小红书、YouTube、X。
+
+*Contact sheets work for anything yt-dlp can download; subtitles go through yt-dlp except
+for Xiaohongshu. Tested on Bilibili, Xiaohongshu, YouTube and X.*
+
+- **B 站**的 AI 字幕**必须登录**，要加 `--browser`。刚在浏览器登录完得等几秒再跑：
+  Chromium 系 cookie 落盘有延迟，在那之前抽到的是旧登录态，B 站会回一句很误导人的
+  `Subtitles are only available when logged in`——那句话跟你登没登其实没关系。
+
+  ***Bilibili*** *AI subtitles require login (`--browser`). Wait a few seconds after logging
+  in: Chromium writes cookies to disk lazily, and until it does you get the stale session
+  plus a badly misleading `Subtitles are only available when logged in`.*
+
+- **YouTube** 的自动字幕里，真 ASR 那条标成 `<lang>-orig`，其余一两百条都是机翻。
+  不指定语种时默认只取原生轨，不然会一次落下一百多个文件。
+
+  ***YouTube*** *marks the real ASR track `<lang>-orig`; the other ~150 are machine
+  translations. Without `-l`, only the original is taken.*
+
+## 已知限制 / Known limitations
+
+- 小红书那条路靠解析页面里的 `__INITIAL_STATE__`，**页面结构一变就会失效**。这也是为什么
+  小红书的字幕支持更应该进 yt-dlp 上游，而不是长期由这里维护。
+
+  *The Xiaohongshu path parses `__INITIAL_STATE__` and **will break when the page changes**.
+  This is exactly why that support belongs upstream in yt-dlp rather than here.*
+
+- 样片标签用 ImageMagick 的 `montage -label`，需要系统里有可用字体；找不到就交回给
+  ImageMagick 自己的 fontconfig，某些机器上标签可能不渲染。
+
+  *Labels rely on a usable system font; without one, rendering falls back to fontconfig
+  and may come out blank.*
+
+- ASR 会听错专名。有次《牛来》被听成「牛奶」，而画面里的硬字幕写得清清楚楚——要紧的
+  视频，字幕和样片两条都跑。
+
+  *ASR mishears proper nouns. One clip's title was transcribed as "milk" while the burned-in
+  caption on screen spelled it out correctly. For anything that matters, run both paths.*
+
+## License
+
+MIT
