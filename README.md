@@ -138,6 +138,41 @@ Perceptual hashing barely separates them either (median PHASH 2.01 vs 2.30). Pix
 perceptual distance answer "did the picture change", not "did the meaning repeat".
 So dedup only removes visually identical frames; cell count is what actually controls redundancy.*
 
+### 抽帧的四条毛边（20260828 一次性修掉）
+
+**黑屏帧会被扔掉、往后挪一点重抽。** 讲解片常有整段黑底配字幕，那种格子在样片上
+就是一块白扔掉的黑。判据是**上 70% 的灰度标准差**——必须避开底部字幕带：连字幕
+一起算，纯黑帧是 19.9，跟真画面贴上了；只看上 70% 是 5.2，而**昏暗但有内容**的
+真画面（夜戏荒原、暗色 UI）低到 17.5。阈值取 10，卡在这条空档中间。
+
+**去重跟每一张已留下的帧比，不再只跟上一张。** 实测有两格隔了 4 分钟的同一张图，
+PHASH 0.24——**本来就在 0.35 阈值以下**，只是中间隔了十几帧，从来没被拿来比过。
+阈值一个字没改，改的是比谁。为了不把 O(n²) 次 `compare` 真跑出来（190 对要 15 秒，
+6 分钟的片子要 4 分钟），先用 8×8 灰度签名粗筛：190 对里只放行 3% 进 PHASH，
+0.5 秒。粗筛只挡"明显不同"，不当判据——它跟 PHASH 不同序。**190 对暴力验证过：
+真重复一对都没漏。**
+
+**挨得太近的切点先合并（1 秒内算同一镜头）。** 镜头**内部**的快速运镜会让 scene
+detect 连报几刀——实测同一个镜头里 0:48.0 和 0:48.3 报了两刀，于是"每切点一帧"
+变成同一镜头抽三帧。合并之后再按"切点不复用"选，一个切点一个镜头。
+
+**样片标签带一位小数，抽帧让开切点 0.3 秒。** 标签以前截断到整秒，而选帧落在切点上、
+切点很少在整秒——19.9 秒那一帧标成 `0:19`，照着敲 `-z 0:19` 会 seek 到 19.0、
+落在上一个镜头里。标签是给人抄回去用的，就得抄得回去。让开 0.3 秒是躲开刀口上的
+叠化/黑场过渡帧。
+
+*Four rough edges fixed together (2026-08-28): blank frames are detected on the **top 70%**
+only (burned-in subtitles lift a pure-black frame's stddev to 19.9, colliding with real
+footage; the top 70% gives 5.2 for black and 17.5 for the darkest real frame — threshold 10)
+and re-sampled a little later. Dedup now compares against **every** kept frame rather than
+only the previous one — a pair four minutes apart scored PHASH 0.24, already under the 0.35
+threshold, and had simply never been compared; an 8×8 grey signature prefilters so only 3%
+of pairs reach the expensive `compare` (validated against all 190 pairs: no true duplicate
+skipped). Scene cuts closer than 1s are merged, since camera movement **inside** one shot
+makes the detector fire repeatedly. Labels carry one decimal and extraction leads the cut by
+0.3s, so a label can be pasted straight back into `-z`.*
+
+
 ## 安装 / Install
 
 ```bash
@@ -163,8 +198,12 @@ watchvideo <url> --browser chrome  # 借浏览器 cookie       borrow browser co
 ```
 
 环境变量 `WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` 可以省掉每次输入。
+⚠️ `WATCHVIDEO_OUT` **会改掉产物的落点**（默认是当前目录）——设了之后东西不在
+你跑命令的地方。跑完那行 `-> ` 打的是绝对路径，以它为准；`--help` 里也会显示当前生效值。
 
-*`WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` set your defaults.*
+*`WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` set your defaults. Note that
+`WATCHVIDEO_OUT` **relocates the output** (default: current directory) — files
+won't be where you ran the command. The `-> ` line prints the absolute path.*
 
 ## 站点 / Sites
 

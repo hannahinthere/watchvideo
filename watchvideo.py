@@ -58,13 +58,92 @@ def srt_to_txt(path: Path) -> Path:
     return dest
 
 
+def landed(dest: Path, detail: str):
+    """产物落地那一行。**打绝对路径，不是 dest.name**（20260827 立卷）：
+    OUTDIR 默认是 '.'，但 $WATCHVIDEO_OUT 会把落点悄悄挪走——只印一个光秃文件名，
+    使用者会理所当然去 cwd 找，然后找不着。一个"看起来是相对路径"的输出，
+    配上一个静默改目的地的环境变量，正好凑成一个陷阱。
+    终端里的一行事实胜过文档里的一节；顺带在多数终端里还能直接点开。"""
+    print(f'  -> {dest}  ({detail})')
+
+
 def report(path: Path, fmt: str):
     out = srt_to_txt(path) if fmt == 'txt' else path
     n = len(out.read_text(encoding='utf-8').strip().splitlines())
-    print(f'  -> {out.name}  ({n} 行)')
+    landed(out, f'{n} 行')
 
 
 # ---------- 小红书 ----------
+
+# 浏览器数据目录（macOS）。只用来**分辨"读不到"的原因**，不用来找 cookie 本身
+# ——找 cookie 的活儿归 yt-dlp。
+_BROWSER_DIRS = {
+    'chrome':  '~/Library/Application Support/Google/Chrome',
+    'edge':    '~/Library/Application Support/Microsoft Edge',
+    'brave':   '~/Library/Application Support/BraveSoftware/Brave-Browser',
+    'chromium': '~/Library/Application Support/Chromium',
+    'vivaldi': '~/Library/Application Support/Vivaldi',
+    'firefox': '~/Library/Application Support/Firefox',
+    'safari':  '~/Library/Safari',
+}
+
+
+def _host_app():
+    """往上找到装着这个终端的 .app。
+    ⚠️ TCC 授权是**按 app 发的，不是按"终端"发的**，所以提示里必须指名道姓：
+    在 A 终端里授过权、这次却在 B 终端里跑，是很常见的情况；这时只说
+    "给终端开权限"，读的人会理解成"我早开过了"，然后往别的方向查半天。"""
+    try:
+        pid = os.getpid()
+        for _ in range(10):
+            out = subprocess.run(['ps', '-o', 'ppid=,comm=', '-p', str(pid)],
+                                 capture_output=True, text=True).stdout.strip()
+            if not out:
+                return None
+            parts = out.split(None, 1)
+            if len(parts) < 2:
+                return None
+            # ⚠️ 排掉 framework 里那层 .app：Homebrew 的解释器路径长这样——
+            # `…/python@3.14/…/Python.framework/Versions/3.14/Resources/Python.app/
+            # Contents/MacOS/Python`，不排的话第一步就匹配上，回一个 "Python"
+            # 当成终端名（20260827 实测踩到）。真正的终端是最外层那个 .app。
+            path = parts[1]
+            m = re.search(r'/([^/]+)\.app/Contents/MacOS/', path)
+            if m and '.framework/' not in path and '/Frameworks/' not in path:
+                return m.group(1)
+            pid = int(parts[0])
+    except Exception:
+        pass
+    return None
+
+
+def cookie_advice(browser):
+    """借不到 cookie 时，分辨到底是哪一种"借不到"，回一句能照着做的话。
+
+    ⚠️ yt-dlp 那句 `could not find <browser> cookies database in "<path>"` **会骗人**
+    （20260827 立卷）：macOS 的 TCC 挡的是**列目录**，不是文件本身——
+    `ls "<dir>"` 报 Operation not permitted，可 `ls "<dir>/Default/Cookies"` 好好的，
+    库就在那儿、浏览器正开着。yt-dlp 靠枚举去找库，被挡住就报"找不到"，
+    读的人会以为浏览器没装或没登录过，往错的方向查半天。
+    ⚠️ 这个授权**会被 macOS 大版本升级重置**，所以"以前好好的"不是反证。"""
+    d = _BROWSER_DIRS.get(browser)
+    if not d or sys.platform != 'darwin':
+        return None
+    path = os.path.expanduser(d)
+    try:
+        os.listdir(path)
+        return None                      # 列得动，那就是真没有 cookie / 没登录
+    except PermissionError:
+        app = _host_app()
+        who = f'「{app}」' if app else '这个终端 app'
+        return (f'  真正拦住的是 macOS 的隐私授权，不是"没有 cookie 库"：'
+                f'库就在 {path} 里，但{who}没权限列它。\n'
+                f'  去「系统设置 → 隐私与安全性 → 完全磁盘访问权限」把{who}加进去。\n'
+                f'  ⚠️ 授权是**按 app 发的**：别的终端授过权不算数，换个终端就得重来；'
+                f'而且 macOS 大版本升级会把已有的授权重置掉。')
+    except FileNotFoundError:
+        return f'  {browser} 的数据目录不存在（{path}），是不是没装/没跑过？'
+
 
 def _cookie_header(browser, workdir, domain):
     if browser == 'none':
@@ -184,9 +263,14 @@ def _tracks(url, browser):
     # writesubtitles/listsubtitles 为真时才真去取，裸 -J 会返回空 subtitles。
     # -J 本身是 simulate，不会真写文件。
     cmd = ['yt-dlp', '--skip-download', '--write-subs', '-J']
-    if browser != 'none':
-        cmd += ['--cookies-from-browser', browser]
-    r = subprocess.run(cmd + [url], capture_output=True, text=True)
+    r = subprocess.run(
+        (cmd + ['--cookies-from-browser', browser] if browser != 'none' else cmd) + [url],
+        capture_output=True, text=True)
+    if r.returncode and browser != 'none' and 'cookies' in (r.stderr or '').lower():
+        # cookie 罐读不出来（浏览器没装/从没跑过/正被锁着）**不是"没有字幕轨"**。
+        # 不降级的话这里回空表，调用方就据此宣布"没找到任何字幕轨"——
+        # 把锅扣给了站点。多数站的字幕根本不需要登录，先拿到能拿的。
+        r = subprocess.run(cmd + [url], capture_output=True, text=True)
     try:
         info = json.loads(r.stdout)
     except json.JSONDecodeError:
@@ -203,12 +287,27 @@ def generic(url, lang, fmt, outdir, browser, list_only):
     if list_only:
         return subprocess.run(base + ['--list-subs', url]).returncode
 
+    warned = []
+
     def attempt(langs):
         before = set(outdir.glob('*.srt'))
-        rc = subprocess.run(base + [
-            '--write-subs', '--write-auto-subs', '--convert-subs', 'srt',
-            '--sub-langs', langs,
-            '-o', str(outdir / '%(title)s.%(ext)s'), url]).returncode
+        tail = ['--write-subs', '--write-auto-subs', '--convert-subs', 'srt',
+                '--sub-langs', langs,
+                '-o', str(outdir / '%(title)s.%(ext)s'), url]
+        rc = subprocess.run(base + tail).returncode
+        if rc and browser != 'none' and not warned:
+            # 借不到 cookie 不该拖垮整次抓取——真正需要登录的只有 B 站那几家。
+            # 降级重试一次，并且**明说降级了**：否则最后那句"没抓到字幕轨"
+            # 就成了假结论，把锅扣给站点，而真凶是读不到 cookie 罐。
+            # 至于罐子为什么读不到，交给 cookie_advice() 去分辨——最常见的那种
+            # 原因，浏览器的报错本身就是错的。
+            warned.append(1)
+            print(f'  借 {browser} 的 cookie 失败了，改成不带 cookie 再试一次'
+                  f'（要登录才给字幕的站点这次会拿不到）。', file=sys.stderr)
+            advice = cookie_advice(browser)
+            if advice:
+                print(advice, file=sys.stderr)
+            rc = subprocess.run(['yt-dlp', '--skip-download'] + tail).returncode
         return rc, sorted(set(outdir.glob('*.srt')) - before)
 
     if lang:
@@ -292,13 +391,30 @@ def _pick_times(cuts, dur, n):
     """
     if len(cuts) < max(4, n // 3):     # 基本静止的片子，场景检测没意义
         return [dur * (i + 0.5) / n for i in range(n)]
+    # 先合并挨得太近的切点（20260828）：镜头**内部**的快速运镜会让 scene detect
+    # 连报几刀——实测 Roman 那片 0:48.0 和 0:48.3 报了两刀，其实是同一个镜头里
+    # 探测器阵列在移动。不合并的话"每个切点最多一帧"就变成了同一镜头抽两帧。
+    # ⚠️ 老版本靠 `abs(c - picked[-1]) <= 0.5` 挡这个，改成"切点不复用"时别把它一起丢了。
+    merged = []
+    for c in sorted(cuts):
+        if not merged or c - merged[-1] > MIN_SHOT:
+            merged.append(c)
     picked = []
+    used = set()
     for i in range(n):
         mid = dur * (i + 0.5) / n
-        c = min(cuts, key=lambda t: abs(t - mid))
-        # 这一段没有属于自己的镜头（撞上了前一格选中的切点）就退回段中点，
-        # 而不是把这一格丢掉——否则格数会随片子的剪辑风格莫名其妙地变少
-        if picked and abs(c - picked[-1]) <= 0.5:
+        # ⚠️ 切点**不复用**（20260828）。老版本撞车时退回段中点，而段中点往往还在
+        #    同一个镜头里——于是同一镜头抽出两帧，样片上两格连标签都一样（那对狼，
+        #    实测 PHASH 7.56，感知上差得远，去重根本抓不住）。改成挑"最近的、还没
+        #    被用过的切点"：一个切点开一个镜头，不复用就等于每镜头最多一帧，
+        #    确定性的，不靠阈值。切点真用光了才退回段中点（保住格数，同老版本用意）。
+        avail = [t for t in merged if t not in used]
+        if avail:
+            c = min(avail, key=lambda t: abs(t - mid))
+            used.add(c)
+            # 让开切点那一帧本身：正好压在刀口上会抽到叠化/黑场的过渡帧
+            c = min(c + CUT_LEAD, dur - TAIL_PAD)
+        else:
             c = mid
         picked.append(c)
     return picked
@@ -374,6 +490,57 @@ def _auto_grids(dur, n_cuts=0):
     return max(base, min(n_cuts, MAX_CELLS)) if n_cuts else base
 
 
+CUT_LEAD = 0.3      # 切点后让开这么久再抽（躲过渡帧）
+MIN_SHOT = 1.0      # 比这更近的两刀当成同一个镜头（运镜误报）
+TAIL_PAD = 0.5      # 抽帧最晚只到片尾前这么久。
+                    # ⚠️ 别缩到 0.05：贴着 EOF seek，ffmpeg 抽不出帧，
+                    # 报 "Could not open encoder before EOF" 并往 stderr 吐一堆，
+                    # 那一格白丢（20260828 实测，B 站那条 13:53 的片子撞上了）。
+BLANK_STD = 10.0    # 上 70% 灰度标准差低于它 = 纯色/黑屏。
+                    # ⚠️ 别往上调：实测真黑屏是 5.2，而**昏暗但有内容**的真画面
+                    # （夜戏荒原、暗色 UI）低到 17.5。20 会把它们一起误杀，
+                    # 10 卡在这条 5.2→17.5 的空档中间。
+PRE_CUT = 8.0       # 粗筛：签名距离超过它就不必再跑 PHASH 了
+
+
+def _flatness(path):
+    """画面有多"平"。**只看上 70%，避开烧死的字幕带**。
+
+    实测（20260828 那张 20 格样片）：纯黑帧连字幕一起算标准差 19.9，跟真画面
+    贴得很近；避开字幕带之后黑帧是 5.2、真画面 44 —— 差一个数量级，随便画条线都行。
+    量不出来就返回一个大数，宁可漏判也别误杀。
+    """
+    r = subprocess.run(['magick', str(path), '-gravity', 'North',
+                        '-crop', '100x70%+0+0', '+repage', '-colorspace', 'Gray',
+                        '-format', '%[fx:standard_deviation*255]', 'info:'],
+                       capture_output=True, text=True)
+    try:
+        return float((r.stdout or '').strip())
+    except ValueError:
+        return 999.0
+
+
+def _sig(path):
+    """8×8 灰度缩略图，只当**粗筛**签名用，不当判据。
+
+    它跟 PHASH 不同序（实测有一对签名距离 0.50 而 PHASH 2.21，另一对 0.61 / 0.24），
+    所以不能拿它判重复。但它足够挡掉"明显不同"的：20 格样片的 190 对里，
+    10% 分位就已经是 21.3，取阈值 8 只放行 3% 进 PHASH——
+    两两比对从 190 次子进程（15 秒）降到 6 次（0.5 秒），而真重复那对距离 0.61，
+    离阈值有 13 倍余量。
+    """
+    r = subprocess.run(['magick', str(path), '-colorspace', 'Gray',
+                        '-resize', '8x8!', '-depth', '8', 'txt:'],
+                       capture_output=True, text=True)
+    return [int(m) for m in re.findall(r'gray\((\d+)\)', r.stdout or '')]
+
+
+def _sig_dist(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0      # 签名没拿到就别筛，让它进 PHASH
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
 def _drop_dupes(made, keep):
     """按感知哈希顺序去重，只清掉近乎全等的帧。
 
@@ -382,18 +549,31 @@ def _drop_dupes(made, keep):
     机位上真实的表情变化距离却很低——两条真实样本的中位数几乎一样。
     所以这里只负责扔掉肉眼全等的，剩下的冗余交给 _auto_grids 用格数去控。
     """
-    kept = []
+    kept, sigs = [], []
     for t, q in made:
-        if kept:
-            r = subprocess.run(['compare', '-metric', 'PHASH', str(kept[-1][1]),
+        sig = _sig(q)
+        dup = False
+        # ⚠️ 跟**每一张**已留下的比，不是只跟上一张（20260828）。老版本只比
+        #    kept[-1]，隔得远的重复穿不过去：实测 0:28 和 4:45 是同一张图，
+        #    PHASH 0.24 —— **本来就在 0.35 阈值以下**，只是中间隔了十几帧，
+        #    从来没被拿来比过。阈值一个字没改，改的是比谁。
+        #    先用 _sig 粗筛，别把 O(n²) 次 compare 真的跑出来。
+        for ks, (_, kq) in zip(sigs, kept):
+            if _sig_dist(sig, ks) > PRE_CUT:
+                continue
+            r = subprocess.run(['compare', '-metric', 'PHASH', str(kq),
                                 str(q), 'null:'], capture_output=True, text=True)
             try:
                 if float((r.stderr or '0').split()[0]) < 0.35:
-                    q.unlink(missing_ok=True)
-                    continue
+                    dup = True
+                    break
             except (ValueError, IndexError):
                 pass
+        if dup:
+            q.unlink(missing_ok=True)
+            continue
         kept.append((t, q))
+        sigs.append(sig)
     n_kept = len(kept)
     if n_kept <= keep:
         return kept, n_kept
@@ -434,7 +614,13 @@ def _parse_time(text):
 
 
 def _label(t, dur):
-    return f'{t:.1f}s' if dur < 60 else f'{int(t) // 60:d}:{int(t) % 60:02d}'
+    """长片也保留一位小数（20260828）。
+
+    以前是 `int(t)`，截断到整秒。而选帧是**落在镜头切点上**的，切点很少落在整秒——
+    19.9 秒那一帧标成 `0:19`，照着标签敲 `-z 0:19` 会 seek 到 19.0、落在上一个镜头里，
+    于是"样片上是望远镜、单抽出来是火箭"。标签是给人抄回去用的，就得抄得回去。
+    """
+    return f'{t:.1f}s' if dur < 60 else f'{int(t) // 60:d}:{t % 60:04.1f}'
 
 
 def _montage(tiles, cols, rows, cell, dest):
@@ -450,9 +636,10 @@ def _montage(tiles, cols, rows, cell, dest):
 
 def zoom(url, outdir, spec, browser):
     """把指定时间点抽成大图——样片挑出可疑的格子之后用这个看清楚。"""
-    for exe in ('ffmpeg', 'ffprobe', 'montage'):
+    for exe in ('ffmpeg', 'ffprobe', 'montage', 'magick', 'compare'):
         if not shutil.which(exe):
-            sys.exit(f'缺 {exe}（montage 来自 imagemagick: brew install imagemagick）')
+            sys.exit(f'缺 {exe}（montage/magick/compare 来自 imagemagick: '
+                     f'brew install imagemagick）')
 
     times = [_parse_time(x) for x in spec.split(',') if x.strip()]
     if not times:
@@ -483,16 +670,48 @@ def zoom(url, outdir, spec, browser):
         name = first if len(tiles) == 1 else f'{first}+{len(tiles) - 1}'
         dest = outdir / f'{re.sub(r"[/:\\]", "_", video.stem)[:70]}.zoom-{name}.jpg'
         _montage(tiles, cols, rows, cell, dest)
-        print(f'  -> {dest.name}  ({len(tiles)} 帧 / {cols}×{rows}，每格 {cell}px)')
+        landed(dest, f'{len(tiles)} 帧 / {cols}×{rows}，每格 {cell}px')
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def subs_hint(url, browser):
+    """样片/大图跑完，提一句这条视频还有没有字幕。
+    本文件开篇那句忠告是「字幕和画面各自会漏东西，要紧的视频两条都跑」——
+    可跑完一条从不提醒另一条，那句忠告就落不了地。查不着就闭嘴，别成为故障源。"""
+    if re.search(r'xiaohongshu\.com|xhslink', url):
+        # yt-dlp 的 xiaohongshu extractor 里根本没有字幕代码，它说"没有"不是证据
+        # （见本文件开篇）。这里不去猜有没有，只把路指出来。
+        print('  小红书的字幕轨 yt-dlp 看不见，要文字就再跑一次不带 -F。')
+        return
+    try:
+        tracks, native = _tracks(url, browser)
+    except Exception:
+        return
+    if tracks:
+        # ⚠️ 别把前几条轨名摊出来：YouTube 一条视频挂着 150+ 条**机翻**轨
+        # （真 ASR 只有 <lang>-orig 那条），列出来的多半是 `ab`/`aa`/`en-uYU-…`
+        # 这种噪音，读的人只会更慌。复用真正跑的时候那套挑轨逻辑，直接说会挑哪条。
+        pick = _pick(tracks, bool(re.search(ZH_SITES, url)), native)
+        if pick:
+            print(f'  另有 {len(tracks)} 条字幕轨（会挑 {pick}），'
+                  f'要文字就再跑一次不带 -F。')
+        else:
+            print(f'  另有 {len(tracks)} 条字幕轨，但挑不出中文/原生轨；'
+                  f'要文字就用 -l 指定一条，或先跑 --list 看看。')
+    elif re.search(r'bilibili\.com', url) and browser == 'none':
+        # 空手查 B 站永远是空的（AI 字幕要登录，见本文件开篇），
+        # 和小红书那条同一个道理：**查不到不等于没有**，别让沉默冒充结论。
+        print('  B 站的 AI 字幕要登录才看得见，当前 --browser none 查不出来；'
+              '要文字就加 --browser chrome 再跑一次不带 -F。')
+
+
 def contact_sheet(url, outdir, n_frames, browser):
-    for exe in ('ffmpeg', 'ffprobe', 'montage'):
+    for exe in ('ffmpeg', 'ffprobe', 'montage', 'magick', 'compare'):
         if not shutil.which(exe):
-            sys.exit(f'缺 {exe}（montage 来自 imagemagick: brew install imagemagick）')
+            sys.exit(f'缺 {exe}（montage/magick/compare 来自 imagemagick: '
+                     f'brew install imagemagick）')
 
     tmp = Path(tempfile.mkdtemp(prefix='sheet-'))
     try:
@@ -507,15 +726,31 @@ def contact_sheet(url, outdir, n_frames, browser):
         cell = ((1560 // (4 if w >= h else 6)) & ~1)   # 候选帧先按保守宽度抽
         fdir = tmp / 'f'
         fdir.mkdir()
-        made = []
+        made, blank = [], []
         for i, t in enumerate(times):
             # 文件名用序号保证唯一：短片每格不到一秒，按秒命名会撞名，
             # 而 ffmpeg 不加 -y 遇到同名会停在覆盖确认上，白丢一格
             out = fdir / f'{i:03d}.jpg'
-            subprocess.run(['ffmpeg', '-y', '-v', 'error', '-ss', str(t), '-i', str(video),
-                            '-frames:v', '1', '-vf', f'scale={cell}:-2',
-                            str(out)], check=False)
-            made.append((t, out))
+            # 抽到纯黑/纯色就往后挪一点重抽（20260828）：讲解片里整段黑底配字幕
+            # 很常见，那种格子在样片上就是一块白扔掉的黑。挪不出来才认。
+            at, flat = t, 0.0
+            for step in (0.0, 0.6, 1.4, 2.5):
+                at = min(t + step, dur - TAIL_PAD)
+                subprocess.run(['ffmpeg', '-y', '-v', 'error', '-ss', str(at),
+                                '-i', str(video), '-frames:v', '1',
+                                '-vf', f'scale={cell}:-2', str(out)], check=False)
+                if not out.exists():
+                    break
+                flat = _flatness(out)
+                if flat >= BLANK_STD:
+                    break
+            # at 始终是**真正抽出这一帧的时刻**——挪了就得跟着挪，
+            # 否则标签又和画面对不上（正是这次要修的那类毛病）
+            if out.exists():
+                (made if flat >= BLANK_STD else blank).append((at, out))
+        # 整片都是黑底字幕的极端情况：宁可给黑格也别给空样片
+        if not made:
+            made = blank
 
         # 按真实时间排序，不靠文件名字母序：超过 10 分钟后 "10m12s" 会排到
         # "1m57s" 前面，样片的时间线就乱了（补零也只是把问题推到 100 分钟）
@@ -544,8 +779,8 @@ def contact_sheet(url, outdir, n_frames, browser):
             dest = outdir / f'{title}.sheet{suffix}.jpg'
             # 标签跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
             _montage([(_label(t, dur), q) for t, q in page], cols, rows, cell, dest)
-            print(f'  -> {dest.name}  ({len(page)} 格 / {cols}×{rows}，'
-                  f'每格 {_eff_px(len(page), w, h):.0f}px)')
+            landed(dest, f'{len(page)} 格 / {cols}×{rows}，'
+                        f'每格 {_eff_px(len(page), w, h):.0f}px')
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -556,7 +791,9 @@ def main():
     p.add_argument('url')
     p.add_argument('-l', '--lang', default=None, help='如 ai-zh / zh-CN / en')
     p.add_argument('-f', '--format', default='txt', choices=['txt', 'srt'])
-    p.add_argument('-o', '--outdir', default=OUTDIR)
+    p.add_argument('-o', '--outdir', default=OUTDIR,
+                   help='输出目录（默认 $WATCHVIDEO_OUT，没设就是当前目录；'
+                        '现在是 %(default)s）')
     p.add_argument('--browser', default=os.environ.get('WATCHVIDEO_BROWSER', 'none'),
                    help='借哪个浏览器的 cookie: chrome/edge/safari/firefox/none'
                         '（B 站字幕必须登录，默认 none 在那里会拿不到）')
@@ -574,9 +811,11 @@ def main():
         if 'xhslink' in url:   # 短链不展开的话 xsec_token 会丢
             req = urllib.request.Request(url, headers={'User-Agent': UA})
             url = urllib.request.urlopen(req, timeout=30).geturl()
-        if a.zoom:
-            return zoom(url, outdir, a.zoom, a.browser)
-        return contact_sheet(url, outdir, a.frames, a.browser)
+        rc = (zoom(url, outdir, a.zoom, a.browser) if a.zoom
+              else contact_sheet(url, outdir, a.frames, a.browser))
+        if rc == 0:
+            subs_hint(url, a.browser)
+        return rc
 
     handler = xiaohongshu if re.search(r'xiaohongshu\.com|xhslink', a.url) else generic
     return handler(a.url, a.lang, a.format, outdir, a.browser, a.list)
