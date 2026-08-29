@@ -798,27 +798,47 @@ def main():
                    help='借哪个浏览器的 cookie: chrome/edge/safari/firefox/none'
                         '（B 站字幕必须登录，默认 none 在那里会拿不到）')
     p.add_argument('--list', action='store_true')
+    # ⚠️ 20260829 她点单改默认：以前 -F 是「抓帧**且不抓字幕**」，两者互斥。
+    #    暴露问题的是当晚那个水獭视频——我跑完拿到六行字幕，**以为已经看完了**，
+    #    是她说"还有抓帧呢"我才知道那八格存在。
+    #    毛病不在多敲一次，在于**只给一半会让人以为完整了**。所以默认两个一起。
     p.add_argument('-F', '--frames', nargs='?', type=int, const=0, default=None,
-                   metavar='N', help='拼印相样片，不抓字幕；N 省略则按时长自动定格数')
+                   metavar='N', help='印相样片的格数；省略则按时长自动定（帧本来就默认抓）')
+    p.add_argument('--no-frames', action='store_true',
+                   help='只要字幕，不抓帧。纯语音的东西（播客/讲座/访谈）抓帧是白抓，还慢')
     p.add_argument('-z', '--zoom', metavar='T[,T...]',
                    help='把指定时间点抽成大图，如 -z 2:15 或 -z 2:11,2:13,2:15')
     a = p.parse_args()
 
     outdir = Path(a.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
-    if a.frames is not None or a.zoom:   # 0 = 自动格数，不能用真值判断 a.frames
-        url = a.url
-        if 'xhslink' in url:   # 短链不展开的话 xsec_token 会丢
-            req = urllib.request.Request(url, headers={'User-Agent': UA})
-            url = urllib.request.urlopen(req, timeout=30).geturl()
-        rc = (zoom(url, outdir, a.zoom, a.browser) if a.zoom
-              else contact_sheet(url, outdir, a.frames, a.browser))
+
+    def expand(u):
+        # xhslink 短链不展开的话 xsec_token 会丢
+        if 'xhslink' not in u:
+            return u
+        req = urllib.request.Request(u, headers={'User-Agent': UA})
+        return urllib.request.urlopen(req, timeout=30).geturl()
+
+    # -z 是「样片看过了，要看某一秒」——精确抽大图，独立动作，不顺带字幕
+    if a.zoom:
+        url = expand(a.url)
+        rc = zoom(url, outdir, a.zoom, a.browser)
         if rc == 0:
             subs_hint(url, a.browser)
         return rc
 
     handler = xiaohongshu if re.search(r'xiaohongshu\.com|xhslink', a.url) else generic
-    return handler(a.url, a.lang, a.format, outdir, a.browser, a.list)
+    rc_sub = handler(a.url, a.lang, a.format, outdir, a.browser, a.list)
+    # --list 是查询动作（列有哪些字幕轨），不该顺带下一整个视频来抓帧
+    if a.no_frames or a.list:
+        return rc_sub
+
+    rc_frame = contact_sheet(expand(a.url), outdir, a.frames if a.frames is not None else 0,
+                             a.browser)
+    # 字幕抓不到但帧抓到了也算有收成（小红书就是这样：yt-dlp 看不见它的字幕轨），
+    # 反之亦然。两边都塌了才算失败。
+    return 0 if (rc_sub == 0 or rc_frame == 0) else (rc_sub or rc_frame)
 
 
 if __name__ == '__main__':

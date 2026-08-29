@@ -1,14 +1,14 @@
 # watchvideo
 
-把一条视频变成模型能读的东西：**字幕**，或者**一张印相样片**。不留视频文件。
+把一条视频变成模型能读的东西：**字幕**和**一张印相样片**。不留视频文件。
 
-*Turn a video into something a model can actually read: **subtitles**, or a single
+*Turn a video into something a model can actually read: **subtitles** and a single
 **contact sheet**. No video file is kept.*
 
 ```bash
-watchvideo <url>            # 抓字幕，默认纯文本      subtitles, plain text
-watchvideo <url> -F         # 拼一张印相样片          one contact sheet
-watchvideo <url> --list     # 先看有哪些字幕轨        list available tracks
+watchvideo <url>              # 字幕 + 样片，一次给全   subtitles + contact sheet
+watchvideo <url> --no-frames  # 只要字幕                subtitles only
+watchvideo <url> --list       # 先看有哪些字幕轨        list available tracks
 ```
 
 ## 长什么样 / What it looks like
@@ -186,10 +186,10 @@ Linux 用各自的包管理器装这三个即可。把 `watchvideo.py` 放进 PA
 ## 用法 / Usage
 
 ```bash
-watchvideo <url>                   # 字幕，纯文本（默认）  subtitles, plain text
+watchvideo <url>                   # 字幕 + 样片（默认）    subtitles + sheet
+watchvideo <url> --no-frames       # 只要字幕              subtitles only
 watchvideo <url> -f srt            # 要时间轴              keep timestamps
 watchvideo <url> -l zh-CN          # 指定语种              pick a language
-watchvideo <url> -F                # 印相样片              contact sheet
 watchvideo <url> -F 20             # 显式给格数            explicit cell count
 watchvideo <url> -z 2:15           # 放大某个时间点        zoom into one moment
 watchvideo <url> -z 2:11,2:13,2:15 # 放大多个时间点        several moments
@@ -204,6 +204,34 @@ watchvideo <url> --browser chrome  # 借浏览器 cookie       borrow browser co
 *`WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` set your defaults. Note that
 `WATCHVIDEO_OUT` **relocates the output** (default: current directory) — files
 won't be where you ran the command. The `-> ` line prints the absolute path.*
+
+## 0.3 起：两条一起跑 / Since 0.3: both paths by default
+
+0.2 及之前，`-F` 的意思是「拼样片，**而且不抓字幕**」——两条路互斥，一次只能要一样。
+
+**这不是加了个新默认，是把文档早就在教的事挪进了代码。** 本文件「已知限制」那一节
+从发布起就写着：*ASR 会听错专名……要紧的视频，字幕和样片两条都跑。* 文档让你手动做的事，
+工具却设成了二选一。而且这个项目叫 `watchvideo` 不叫 `getsubs`——**只给文字，本来就没兑现名字。**
+
+⚠️ **但这确实是行为变更，不是纯粹的增补**：默认路径现在会**下载整个视频**来抽帧，
+比只拉字幕慢一个数量级，还会多产一个 `.sheet.jpg`。把它写进脚本的人明天会觉得变慢了。
+
+- **要旧行为**：`--no-frames`。纯语音的东西（播客、讲座、访谈）抽帧是白抽，用它。
+- `--list` 不受影响：那是「问有哪些字幕轨」，不该顺带下一整个视频。
+- `-z` 不受影响：那是「样片看过了，我要看某一秒」，独立动作。
+- 字幕拿不到但样片拿到了仍算成功（小红书就是这样，yt-dlp 看不见它的字幕轨），反之亦然；两条都塌了才返回非零。
+
+*Through 0.2, `-F` meant "make a sheet **and skip subtitles**" — the two paths were
+mutually exclusive. **This release doesn't add a new default so much as move into the code
+what the docs already told you to do**: the Known limitations section has said since day one
+that for anything that matters you should run both paths. And the project is called
+`watchvideo`, not `getsubs` — text alone never quite delivered on the name.*
+
+*It is still a behaviour change: the default path now **downloads the whole video** to
+sample frames — an order of magnitude slower than fetching subtitles, plus one extra
+`.sheet.jpg`. Use `--no-frames` for the old behaviour (and for audio-only material, where
+frames are worthless). `--list` and `-z` are unaffected. If one path fails but the other
+succeeds the run still exits 0; only a double failure is an error.*
 
 ## 站点 / Sites
 
@@ -240,11 +268,12 @@ for Xiaohongshu. Tested on Bilibili, Xiaohongshu, YouTube and X.*
   *Labels rely on a usable system font; without one, rendering falls back to fontconfig
   and may come out blank.*
 
-- ASR 会听错专名。有次《牛来》被听成「牛奶」，而画面里的硬字幕写得清清楚楚——要紧的
-  视频，字幕和样片两条都跑。
+- ASR 会听错专名。有次《牛来》被听成「牛奶」，而画面里的硬字幕写得清清楚楚——**两条
+  互相校对，这也正是 0.3 起默认两条都跑的原因**（见上一节）。
 
   *ASR mishears proper nouns. One clip's title was transcribed as "milk" while the burned-in
-  caption on screen spelled it out correctly. For anything that matters, run both paths.*
+  caption on screen spelled it out correctly. **The two paths check each other — which is
+  exactly why 0.3 runs both by default** (see above).*
 
 ## License
 
