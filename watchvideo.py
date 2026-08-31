@@ -205,7 +205,13 @@ def xiaohongshu(url, lang, fmt, outdir, browser, list_only):
         if blk:
             break
     if not blk:
-        sys.exit('这条笔记没有字幕轨（图文笔记、或视频没生成字幕）')
+        # ⚠️ 20260831 这里原来是 sys.exit，那会**直接终止进程**，main() 里
+        #    "字幕挂了还要接着抓帧"那一段永远跑不到。20260830 改默认时我在 main()
+        #    的注释里写明了这个场景（"小红书就是这样：yt-dlp 看不见它的字幕轨"），
+        #    但没实现——**真正的退出点在更下层，而我只测了有字幕的视频。**
+        #    改成 return，把返回码交回 main()，让它决定还要不要抓帧。
+        print('这条笔记没有字幕轨（图文笔记、或视频没生成字幕）', file=sys.stderr)
+        return 1
     subs = json.loads(blk)
 
     if list_only:
@@ -218,7 +224,9 @@ def xiaohongshu(url, lang, fmt, outdir, browser, list_only):
 
     if lang:
         if lang not in subs:
-            sys.exit(f'没有 {lang} 这条轨，有的是: {", ".join(subs)}')
+            # 同上：不许在 handler 里 exit，返回码交给 main()
+            print(f'没有 {lang} 这条轨，有的是: {", ".join(subs)}', file=sys.stderr)
+            return 1
         picked = {lang: subs[lang]}
     else:
         # 自动挡：中文站看的基本是中文内容，默认就取中文轨
