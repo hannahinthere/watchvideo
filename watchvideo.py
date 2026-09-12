@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -188,11 +189,27 @@ def _json_block(s, key):
     return None
 
 
-def xiaohongshu(url, lang, fmt, outdir, browser, list_only):
-    # 短链要先展开，xsec_token 在查询串里，丢了就取不到页面
+def expand_xhs(url):
+    """展开 xhslink 短链，再把 /login?redirectPath=… 拆回真地址。
+
+    xsec_token 在查询串里，丢了就取不到页面。小红书现在还会把匿名请求先打到
+    登录页，真地址连同 token 一起被包进 redirectPath —— 不拆出来，后面拿到的
+    全是登录页。"""
     if 'xhslink' in url:
         req = urllib.request.Request(url, headers={'User-Agent': UA})
         url = urllib.request.urlopen(req, timeout=30).geturl()
+    if not re.search(r'xiaohongshu\.com|xhslink', url):
+        return url          # 别的站原样放行：这函数在 main 里对所有 url 都会走一遍
+    for _ in range(3):
+        nxt = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get('redirectPath')
+        if not nxt or not nxt[0].lower().startswith('http'):
+            break
+        url = nxt[0]
+    return re.sub(r'^http://', 'https://', url)
+
+
+def xiaohongshu(url, lang, fmt, outdir, browser, list_only):
+    url = expand_xhs(url)
 
     # 先不带 cookie 抓：小红书对登录态会返回另一套页面，里面根本没有字幕数据。
     # 匿名页反而带全 subtitles，所以匿名优先，拿不到再拿登录态兜底。
@@ -388,7 +405,15 @@ def _scene_cuts(path, threshold=0.3):
          f'movie={path},select=gt(scene\\,{threshold})',
          '-show_entries', 'frame=pts_time', '-of', 'csv=p=0'],
         capture_output=True, text=True)
-    return [float(x) for x in r.stdout.split() if x.strip()]
+    # 20260908 修：csv=p=0 的每行可能带尾逗号（ffprobe 多输出一个空字段），
+    # 直接 float() 会炸在 '481.050000,' 上。剥掉逗号再转，转不动的跳过。
+    out = []
+    for x in r.stdout.split():
+        x = x.strip().rstrip(",")
+        if not x: continue
+        try: out.append(float(x))
+        except ValueError: pass
+    return out
 
 
 def _pick_times(cuts, dur, n):
@@ -806,9 +831,9 @@ def main():
                    help='借哪个浏览器的 cookie: chrome/edge/safari/firefox/none'
                         '（B 站字幕必须登录，默认 none 在那里会拿不到）')
     p.add_argument('--list', action='store_true')
-    # ⚠️ 20260829 她点单改默认：以前 -F 是「抓帧**且不抓字幕**」，两者互斥。
-    #    暴露问题的是当晚那个水獭视频——我跑完拿到六行字幕，**以为已经看完了**，
-    #    是她说"还有抓帧呢"我才知道那八格存在。
+    # ⚠️ 20260829 改默认：以前 -F 是「抓帧**且不抓字幕**」，两者互斥。
+    #    暴露问题的是一条几乎没有语音的视频——只拿到六行字幕，**就以为已经看完了**，
+    #    其实画面里还有一整组镜头没看见。
     #    毛病不在多敲一次，在于**只给一半会让人以为完整了**。所以默认两个一起。
     p.add_argument('-F', '--frames', nargs='?', type=int, const=0, default=None,
                    metavar='N', help='印相样片的格数；省略则按时长自动定（帧本来就默认抓）')
@@ -821,12 +846,7 @@ def main():
     outdir = Path(a.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    def expand(u):
-        # xhslink 短链不展开的话 xsec_token 会丢
-        if 'xhslink' not in u:
-            return u
-        req = urllib.request.Request(u, headers={'User-Agent': UA})
-        return urllib.request.urlopen(req, timeout=30).geturl()
+    expand = expand_xhs
 
     # -z 是「样片看过了，要看某一秒」——精确抽大图，独立动作，不顺带字幕
     if a.zoom:
