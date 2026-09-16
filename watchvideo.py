@@ -300,9 +300,13 @@ def _tracks(url, browser):
         info = json.loads(r.stdout)
     except json.JSONDecodeError:
         return [], None
-    keys = list(info.get('subtitles') or {}) + list(info.get('automatic_captions') or {})
+    # 一条推挂多段视频时 -J 回的是 playlist：顶层 subtitles 是空的，轨全在
+    # entries 里。只看顶层就会把「有 en 轨」报成「没找到任何字幕轨」。
+    nodes = [info] + [e for e in (info.get('entries') or []) if isinstance(e, dict)]
+    keys = [k for n in nodes
+            for k in list(n.get('subtitles') or {}) + list(n.get('automatic_captions') or {})]
     tracks = [k for k in dict.fromkeys(keys) if k not in ('live_chat', 'danmaku')]
-    return tracks, info.get('language')
+    return tracks, next((n['language'] for n in nodes if n.get('language')), None)
 
 
 def generic(url, lang, fmt, outdir, browser, list_only):
