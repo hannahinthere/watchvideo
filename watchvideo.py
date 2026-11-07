@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""看视频：抓字幕，或抽帧拼成印相样片。都不留视频文件。
+"""看视频：抓字幕 + 抽帧拼成印相样片，默认两样一起。都不留视频文件。
 
-    watchvideo <url>                    # 抓字幕，默认 txt
-    watchvideo <url> -F                 # 印相样片，格数按时长自动定
+    watchvideo <url>                    # 字幕(txt) + 印相样片(格数按时长自动定)
+    watchvideo <url> --no-frames        # 只要字幕（播客/讲座/访谈）
     watchvideo <url> -z 2:15            # 把某个时间点抽成大图看清楚
-    watchvideo <url> -F 20              # 显式给格数
+    watchvideo <url> -F 20              # 样片显式给格数
     watchvideo <url> --list             # 先看有哪些字幕轨
     watchvideo <url> -l en -f srt        # 指定语种 / 要时间轴
+    watchvideo <url> -H                 # 字幕换成读画面上的硬字幕（方言/无字幕轨/自动字幕不准）+ 样片
+    watchvideo <url> -H -f srt          # 同上，字幕带时间轴
+    watchvideo <url> -H --ocr vision    # 两行字幕 / 多行花字：换 macOS Vision
+    watchvideo <url> --keep-ads         # B 站默认剃掉恰饭段（社区标注），不想剃就加这个
 
 字幕和画面各自会漏东西：字幕漏掉画面里引用的图，画面漏掉说了什么，
 而 ASR 还会听错专名（《牛来》被听成"牛奶"）。要紧的视频两条都跑。
@@ -15,6 +19,10 @@
 （sns-subtitle-s2.xhscdn.com），但 yt-dlp 的 xiaohongshu extractor
 里完全没有字幕代码，只会回一句 "has no subtitles"——那不是证据，
 所以这里自己从页面 JSON 里解析。
+
+硬字幕（-H）：先抽 24 帧自动找字幕在画面哪一条，再逐句识别。默认引擎 PP-OCRv6 tiny
+（模型放 $WATCHVIDEO_MODELS，默认 ~/.cache/watchvideo/models；4.4MB，快且准，只认单行）；Vision 是系统自带的后备，会吞"的"。
+23 分钟视频约 20 秒。字幕带找错了用 --sub-region 0.25 手动指定底部比例。
 
 B 站的 AI 字幕必须登录。刚在浏览器登录完要等几秒再跑：
 Chromium 系 cookie 落盘有延迟，在那之前抽到的是旧登录态，
@@ -68,7 +76,34 @@ def landed(dest: Path, detail: str):
     print(f'  -> {dest}  ({detail})')
 
 
+# 带时间的字幕（20261029）：样片每格配「那一刻在说什么」、字幕里的视觉提示词强制加帧，都要它。
+# 默认输出是 txt，srt 转完就删了——所以在删之前先解析进这里。只认第一份（多语种时先到先得）。
+CUES = []   # [(开始秒, 结束秒, 文本)]
+
+
+def _parse_srt(path: Path):
+    out = []
+    for block in path.read_text(encoding='utf-8', errors='replace').replace('\r', '').split('\n\n'):
+        ls = [l.strip() for l in block.strip().splitlines()]
+        tl = next((i for i, l in enumerate(ls) if '-->' in l), None)
+        if tl is None:
+            continue
+        m = re.findall(r'(\d+):(\d+):(\d+)[,.](\d+)', ls[tl])
+        if len(m) < 2:
+            continue
+        sec = lambda g: int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 10 ** len(g[3])
+        text = re.sub(r'<[^>]+>|\{[^}]*\}', '', ' '.join(ls[tl + 1:])).strip()
+        if text and not (out and out[-1][2] == text):   # YouTube 滚动字幕：连续同句只留一条
+            out.append((sec(m[0]), sec(m[1]), text))
+    return out
+
+
 def report(path: Path, fmt: str):
+    if not CUES and path.suffix == '.srt':
+        try:
+            CUES.extend(_parse_srt(path))
+        except OSError:
+            pass
     out = srt_to_txt(path) if fmt == 'txt' else path
     n = len(out.read_text(encoding='utf-8').strip().splitlines())
     landed(out, f'{n} 行')
@@ -269,6 +304,136 @@ ANON_FIRST = r'xiaohongshu\.com|xhslink'
 OUTDIR = os.environ.get('WATCHVIDEO_OUT') or '.'
 
 
+# ── B 站去广告（20261018）──────────────────────────────────────────────────
+# 拉回来的 B 站视频连恰饭段一起拉回来了。yt-dlp 的 --sponsorblock 只认 YouTube，
+# B 站这边用社区版 BilibiliSponsorBlock（「B站空降助手」那个库，bsbsb.top），
+# 接口照抄 SponsorBlock。只剃字幕和样片里落在广告段的部分，视频本来就不留。
+# ⚠️ 没人标过 ≠ 没广告：查不到要明说（0829 那条——只给一半会让人以为完整了）。
+BSB_API = 'https://www.bsbsb.top/api/skipSegments'
+AD_CATS = {'sponsor': '恰饭', 'selfpromo': '自推'}   # 片头片尾、三连提醒不算广告，不剃
+KEEP_ADS = False
+_ads_cache = {}
+
+
+def _bili_get(url, timeout=8):
+    req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': 'https://www.bilibili.com/'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.geturl(), r.read()
+
+
+def _bili_cid(bv, url):
+    """分 P 视频每 P 一个 cid，标注是按 cid 记的。没带 ?p= 就是第 1 P。"""
+    m = re.search(r'[?&]p=(\d+)', url)
+    page = int(m.group(1)) if m else 1
+    try:
+        _, body = _bili_get(f'https://api.bilibili.com/x/web-interface/view?bvid={bv}')
+        pages = json.loads(body)['data']['pages']
+        return str(pages[page - 1]['cid'])
+    except Exception:
+        return None
+
+
+def bili_ads(url):
+    """返回这条 B 站视频要剃掉的 [(起, 止, 类别)]；不是 B 站或查不到就是空表。同一条只查一次。"""
+    if KEEP_ADS or not re.search(r'bilibili\.com|b23\.tv', url):
+        return []
+    if url in _ads_cache:
+        return _ads_cache[url]
+    real = url
+    m = re.search(r'BV[0-9A-Za-z]{10}', url)
+    if not m and 'b23.tv' in url:
+        try:
+            real = _bili_get(url)[0]
+            m = re.search(r'BV[0-9A-Za-z]{10}', real)
+        except Exception:
+            pass
+    segs, note = [], None
+    if not m:
+        note = '认不出 BV 号，广告没剃'
+    else:
+        bv = m.group(0)
+        q = urllib.parse.urlencode({'videoID': bv, 'categories': json.dumps(list(AD_CATS))})
+        try:
+            data = json.loads(_bili_get(f'{BSB_API}?{q}')[1])
+        except urllib.error.HTTPError as e:
+            data = [] if e.code == 404 else None      # SponsorBlock 系没标注时回 404
+        except Exception:
+            data = None
+        if data is None:
+            note = '查广告库失败（bsbsb.top 连不上），广告没剃'
+        else:
+            if {d.get('cid') for d in data} - {None}:
+                cid = _bili_cid(bv, real)
+                if cid:
+                    data = [d for d in data if str(d.get('cid')) == cid]
+                elif len({d.get('cid') for d in data}) > 1:
+                    data, note = [], '分 P 视频认不出是哪一 P，广告没剃'
+            segs = sorted((d['segment'][0], d['segment'][1], d['category']) for d in data
+                          if d.get('actionType', 'skip') == 'skip' and d['segment'][1] > d['segment'][0])
+            if not segs and not note:
+                note = '空降助手里没人标过这条的广告段，没剃（不代表没有）'
+    if segs:
+        mmss = lambda t: f'{int(t) // 60}:{int(t) % 60:02d}'
+        desc = '、'.join(f'{mmss(a)}–{mmss(b)} {AD_CATS.get(c, c)}' for a, b, c in segs)
+        print(f'  去广告：字幕和样片里剃掉 {len(segs)} 段（{desc}）')
+    else:
+        print(f'  去广告：{note}')
+    _ads_cache[url] = segs
+    return segs
+
+
+def _in_ads(t, ads):
+    return any(a <= t < b for a, b, _ in ads)
+
+
+def _cut_srt(path, ads):
+    """删掉中点落在广告段里的字幕句，序号重排。"""
+    def sec(x):
+        h, m, rest = x.strip().replace('.', ',').split(':')
+        s, ms = rest.split(',')
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    keep = []
+    for block in path.read_text(encoding='utf-8').strip().split('\n\n'):
+        lines = block.strip().splitlines()
+        ts = next((l for l in lines if '-->' in l), None)
+        if ts:
+            a, b = ts.split('-->')
+            if _in_ads((sec(a) + sec(b.split()[0])) / 2, ads):
+                continue
+            lines = lines[lines.index(ts):]
+        keep.append(lines)
+    path.write_text('\n\n'.join(f'{i}\n' + '\n'.join(l) for i, l in enumerate(keep, 1)) + '\n',
+                    encoding='utf-8')
+
+
+def _squeeze(ads, dur):
+    """把广告段挖掉后的「正片时间轴」：返回 (正片总长, 切点换算, 正片时刻→原片时刻)。
+    样片在正片轴上均匀取格，格子就不会浪费在广告上，标签仍是原片时刻（-z 要用）。"""
+    iv = []
+    for a, b, _ in ads:
+        a, b = max(0.0, a), min(dur, b)
+        if b <= a:
+            continue
+        if iv and a <= iv[-1][1]:
+            iv[-1][1] = max(iv[-1][1], b)
+        else:
+            iv.append([a, b])
+
+    def real(t):
+        for a, b in iv:
+            if t >= a:
+                t += b - a
+            else:
+                break
+        return t
+
+    def squeeze_cuts(cuts):
+        return [c - sum(min(b, c) - a for a, b in iv if a < c)
+                for c in cuts if not any(a <= c < b for a, b in iv)]
+
+    return dur - sum(b - a for a, b in iv), squeeze_cuts, real
+
+
 def _pick(tracks, zh_first, native=None):
     """挑一条最合意的轨：中文站优先中文轨，其余站优先原生语言轨。"""
     zh = [r'^ai-zh$', r'^zh(-|$)']
@@ -367,7 +532,10 @@ def generic(url, lang, fmt, outdir, browser, list_only):
               'B 站字幕要登录：加 --browser chrome（或 edge/safari），'
               '刚登完还要等几秒让 cookie 落盘。', file=sys.stderr)
         return rc or 1
+    ads = bili_ads(url)
     for f in written:
+        if ads:
+            _cut_srt(f, ads)
         report(f, fmt)
     return rc
 
@@ -378,7 +546,9 @@ def _font():
     """样片标签用的字体。ImageMagick 在有些机器上找不到默认字体
     （报 unable to read font ''），所以显式挑一个；实在没有就不传
     -font，交回给 ImageMagick 自己的 fontconfig。"""
-    for f in ('/System/Library/Fonts/Supplemental/Arial.ttf',
+    # 20261029：标签开始印台词了，中文要有字形——Arial Unicode 打头（Arial 本身没有汉字，会印成方框）
+    for f in ('/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+              '/System/Library/Fonts/Supplemental/Arial.ttf',
               '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
               '/usr/share/fonts/dejavu/DejaVuSans.ttf',
               '/usr/share/fonts/TTF/DejaVuSans.ttf',
@@ -578,7 +748,7 @@ def _sig_dist(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
-def _drop_dupes(made, keep):
+def _drop_dupes(made, keep, must=frozenset()):
     """按感知哈希顺序去重，只清掉近乎全等的帧。
 
     阈值取得保守（PHASH 0.35）是因为像素/感知距离只能回答"画面变了没有"，
@@ -614,12 +784,37 @@ def _drop_dupes(made, keep):
     n_kept = len(kept)
     if n_kept <= keep:
         return kept, n_kept
-    idx = [round(i * (n_kept - 1) / (keep - 1)) for i in range(keep)]
-    return [kept[i] for i in sorted(set(idx))], n_kept
+    # 20261029：字幕里说了「看这里 / 这张图」的那几帧（must）不参与均匀删减，名额先给它们，剩下的再均匀取。
+    #   重复的照样会在上面被去掉——跟已留的一样，就说明画面已经在了。
+    forced = set([i for i, (_, q) in enumerate(kept) if str(q) in must][:keep])
+    # 20261029 改：不再均匀删。一张一张删「跟留下的里面最像的那张」——同一个大头复读六遍的先走，
+    #   弹出来的截图、换了的页跟谁都不像，留下来。
+    #   ⚠️ 时间覆盖底线：全片切成 keep//4 段，每段至少留一张——不然片头花哨快切会把名额吃光，后面安静的部分一张不剩。
+    t0, t1 = kept[0][0], kept[-1][0]
+    nb = max(2, keep // 4)
+    bin_of = [min(nb - 1, int((t - t0) / max(t1 - t0, 1e-6) * nb)) for t, _ in kept]
+    alive = set(range(n_kept))
+    while len(alive) > keep:
+        best, bd = None, None
+        for i in alive:
+            if i in forced or sum(1 for j in alive if bin_of[j] == bin_of[i]) <= 1:
+                continue
+            d = min(_sig_dist(sigs[i], sigs[j]) for j in alive if j != i)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is None:   # 剩下的全是受保护的，按均匀删收尾
+            rest = sorted(alive - forced)
+            best = rest[len(rest) // 2] if rest else sorted(alive)[-1]
+        alive.discard(best)
+    return [kept[i] for i in sorted(alive)], n_kept
 
 
 def _fetch_video(url, tmp, browser):
     """下载视频到 tmp 并返回路径。只在这里处理站点差异，别在调用处各写一遍。"""
+    # 20261024：本地已有的片子（film load 拉下来的整部电影）直接用，不再下一遍。
+    #   读本地片子的硬字幕时没想起 -H，另写了一个糙版——该做的是让这里认本地文件。
+    if os.path.isfile(url):
+        return Path(url)
     order = ['none', browser] if re.search(ANON_FIRST, url) else [browser, 'none']
     err = ['']
     for b in dict.fromkeys(order):
@@ -744,6 +939,63 @@ def subs_hint(url, browser):
               '要文字就加 --browser chrome 再跑一次不带 -F。')
 
 
+# 字幕里的「视觉提示词」（20261029）：说到这些就是在指画面，那一刻强制抽一帧。
+VISUAL_CUE = re.compile(r'(看这里|看这个|看一下|你看|大家看|注意看|请看|来看|我们看|如图|这张图|这个图|图上|图里|画面|屏幕上|界面上|右上角|左上角|右下角|左下角|'
+                        r'演示|展示一下|给大家看|look at|as you can see|you can see|see here|right here|on (?:the )?screen|'
+                        r'this (?:chart|graph|image|picture|screen|slide))', re.I)
+
+
+def _change_events(video, dur, k):
+    """画面突然变了的时刻（20261029）。
+    起因：一条口播视频是真人出镜 + 不停弹出论文截图 / 表格，背景从头到尾不换，scene 只认出 1 个镜头，
+    16 格里 6 格是同一个大头，截图全靠均匀取样碰运气。截图弹出来 = 画面一大块突然变了。
+    每 0.5 秒一张 64×36 灰度图跟上一张比，比前后 10 秒的中位数高一大截就算一次；取变化后 0.7 秒（弹出动画走完）。
+    返回变化最大的 ≤k 个，按时间排。"""
+    W, H, fps = 64, 36, 2
+    raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(video), '-vf', f'fps={fps},scale={W}:{H},format=gray',
+                          '-f', 'rawvideo', 'pipe:1'], capture_output=True).stdout
+    n = W * H
+    fr = [raw[i * n:(i + 1) * n] for i in range(len(raw) // n)]
+    if len(fr) < 4:
+        return []
+    d = [0.0] + [sum(abs(a - b) for a, b in zip(fr[i - 1], fr[i])) / (n * 255) for i in range(1, len(fr))]
+    ev = []
+    for i in range(1, len(d)):
+        win = sorted(d[max(1, i - 20):i + 21])
+        med = win[len(win) // 2]
+        t = i / fps + .7
+        if d[i] > max(.035, med * 3) and t < dur - TAIL_PAD and (not ev or t - ev[-1][0] > 1.5):
+            ev.append((t, d[i]))
+    return sorted(t for t, _ in sorted(ev, key=lambda x: -x[1])[:k])
+
+
+def cue_at(t, back=4.0):
+    """t 那一刻在说的那句；正在说的优先，否则取 back 秒内刚说完的。"""
+    hit = ''
+    for a, b, x in CUES:
+        if a > t:
+            break
+        if a <= t <= b + .3 or t - b <= back:
+            hit = x
+    return hit
+
+
+def _wrap(text, px, size=16, lines=2):
+    """按格子宽度折成 ≤lines 行，超了加省略号。汉字算一个字宽，拉丁算半个多一点。"""
+    per = max(8, int(px / size) - 1)
+    out, cur, w = [], '', 0.0
+    for ch in text:
+        cw = 1.0 if ord(ch) > 0x2e80 else .56
+        if w + cw > per:
+            out.append(cur); cur, w = '', 0.0
+            if len(out) == lines:
+                out[-1] = out[-1][:-1] + '…'
+                return '\n'.join(out)
+        cur += ch; w += cw
+    out.append(cur)
+    return '\n'.join(x for x in out if x)
+
+
 def contact_sheet(url, outdir, n_frames, browser):
     for exe in ('ffmpeg', 'ffprobe', 'montage', 'magick', 'compare'):
         if not shutil.which(exe):
@@ -757,13 +1009,30 @@ def contact_sheet(url, outdir, n_frames, browser):
         w, h, dur = _probe(video)
         cuts = _scene_cuts(video)
         want = n_frames if n_frames > 0 else _auto_grids(dur, len(cuts))
-        times = _pick_times(cuts, dur, want * 2)
+        ads = bili_ads(url)
+        if ads:
+            main_dur, squeeze_cuts, real = _squeeze(ads, dur)
+            times = [real(t) for t in _pick_times(squeeze_cuts(cuts), main_dur, want * 2)]
+        else:
+            times = _pick_times(cuts, dur, want * 2)
+        # 字幕里指了画面的时刻：句子中点强制加一帧（3 秒内的算一处，最多占一半格子）
+        forced_t = []
+        for a_, b_, x in CUES:
+            if VISUAL_CUE.search(x):
+                m = min((a_ + b_) / 2, dur - TAIL_PAD)
+                if not forced_t or m - forced_t[-1] > 3:
+                    forced_t.append(m)
+        forced_t = forced_t[:max(1, want // 2)]
+        # 画面突然变了的时刻（截图弹出、换页）也进候选；最后挑格时「最像别人的先删」会帮它们留下来
+        events = [t for t in _change_events(video, dur, want) if not (ads and _in_ads(t, ads))]
+        cand = sorted(times + forced_t + events)
+        times = [t for i, t in enumerate(cand) if i == 0 or t - cand[i - 1] > .5 or t in forced_t]
 
         # 每格宽度按版式反推，让样片长边落在 ~1560px：再大模型也会缩掉
         cell = ((1560 // (4 if w >= h else 6)) & ~1)   # 候选帧先按保守宽度抽
         fdir = tmp / 'f'
         fdir.mkdir()
-        made, blank = [], []
+        made, blank, must = [], [], set()
         for i, t in enumerate(times):
             # 文件名用序号保证唯一：短片每格不到一秒，按秒命名会撞名，
             # 而 ffmpeg 不加 -y 遇到同名会停在覆盖确认上，白丢一格
@@ -785,6 +1054,8 @@ def contact_sheet(url, outdir, n_frames, browser):
             # 否则标签又和画面对不上（正是这次要修的那类毛病）
             if out.exists():
                 (made if flat >= BLANK_STD else blank).append((at, out))
+                if t in forced_t:
+                    must.add(str(out))
         # 整片都是黑底字幕的极端情况：宁可给黑格也别给空样片
         if not made:
             made = blank
@@ -793,7 +1064,7 @@ def contact_sheet(url, outdir, n_frames, browser):
         # "1m57s" 前面，样片的时间线就乱了（补零也只是把问题推到 100 分钟）
         made = [(t, q) for t, q in sorted(made, key=lambda x: x[0]) if q.exists()]
         n_cand = len(made)
-        shots, n_uniq = _drop_dupes(made, want)
+        shots, n_uniq = _drop_dupes(made, want, must)
         if not shots:
             sys.exit('一帧都没抽出来')
         title = re.sub(r'[/:\\]', '_', video.stem)
@@ -815,16 +1086,276 @@ def contact_sheet(url, outdir, n_frames, browser):
             suffix = '' if n_pages == 1 else f'-{i + 1}'
             dest = outdir / f'{title}.sheet{suffix}.jpg'
             # 标签跟文件名解耦；短片精确到 0.1 秒，长片 m:ss 就够
-            _montage([(_label(t, dur), q) for t, q in page], cols, rows, cell, dest)
+            # 20261029：标签下面再印那一刻在说的话（折两行），格子和台词一眼对上
+            _montage([(_label(t, dur) + ('\n' + _wrap(cue_at(t), cell) if cue_at(t) else ''), q) for t, q in page],
+                     cols, rows, cell, dest)
             landed(dest, f'{len(page)} 格 / {cols}×{rows}，'
                         f'每格 {_eff_px(len(page), w, h):.0f}px')
+        # 格子 ↔ 台词的文字版：读文字比在小图上辨字省事；★ = 字幕里指了画面、强制加的那几帧
+        if CUES:
+            print('  格子台词（★ 字幕里指了画面）：')
+            for t, q in shots:
+                print(f"    {'★' if str(q) in must else ' '} {_label(t, dur):>7}  {cue_at(t) or '—'}")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── 硬字幕 OCR（20261008）──────────────────────────────────────────────────
+# 起因：方言视频——B 站 ai-zh 听不懂方言，又没有字幕轨，
+# 可 UP 主烧进画面的字是人听懂了打的，是准的。字已经在画面上，只差读出来。
+# 做法：只看底部一条 → 相邻帧比差异，字幕变了才算新的一句 → 每句取中间一帧 →
+# macOS 自带 Vision 识别（visionocr，同目录 swift 编的）→ 连续相同的合并 → txt/srt。
+# 同类的 pickcut.cn/ocr 闭源、源码里写明禁止复制抓取，这里只用公开思路，自己搭。
+VISIONOCR = Path(__file__).resolve().parent / 'visionocr'
+# 20261008 下午：拿 pickcut 用的 PP-OCRv6 tiny（4.4MB，Apache 2.0），拉下来对照——
+# 69 条字幕 1.6s vs Vision 4.4s，而且 Vision 系统性吞"的"（"心心念念的老秦人的坟头"→"心心念念老秦人坟头"），
+# PP 25 条只错一个字。改成默认用 PP；它只认单行，两行字幕/多行花字时 --ocr vision 切回去。
+# 模型目录：$WATCHVIDEO_MODELS，默认 ~/.cache/watchvideo/models
+MODELS = Path(os.environ.get('WATCHVIDEO_MODELS') or Path.home() / '.cache/watchvideo/models').expanduser()
+PPOCR_PY = MODELS / '.venv/bin/python'
+PPOCR = Path(__file__).resolve().parent / 'ppocr_rec.py'
+PPOCR_DET = MODELS / 'ppocrv6_tiny_det/inference.onnx'
+
+
+def _find_band(video, tmp, dur, n=24):
+    """先找字幕在哪（pickcut 也是这么干的：先框位置，再只认那一条）。
+    均匀抽 n 帧整图 → Vision 找框 → 只留水平居中的框（排除角落水印/台标）→
+    按框的垂直中线分桶，剔掉固定文字后有字帧数最多的那一档就是字幕带。返回 (y0, y1, x0, x1)，0–1，原点左上；找不到 None。"""
+    d = tmp / 'probe'; d.mkdir(exist_ok=True)
+    for k in range(n):
+        t = dur * (k + 0.5) / n
+        subprocess.run(['ffmpeg', '-loglevel', 'error', '-ss', f'{t:.2f}', '-i', str(video),
+                        '-frames:v', '1', '-vf', 'scale=960:-2', str(d / f'{k:02d}.jpg')], check=False)
+    r = subprocess.run([str(VISIONOCR), '--boxes'] + [str(x) for x in sorted(d.glob('*.jpg'))],
+                       capture_output=True, text=True)
+    hits = {}   # 桶 → [(帧, y0, y1, x0, x1, 去掉数字标点后的字)]
+    anywhere = set()   # (字, 帧)，不管在画面哪儿——水印多半在角落，居中过滤会把它漏掉（比如角落里的频道名）
+    for line in r.stdout.splitlines():
+        o = json.loads(line)
+        for x, y, w, h, txt in o['boxes']:
+            core = re.sub(r'[\W\d_]', '', txt)
+            if len(core) >= 3:
+                anywhere.add((core, o['file']))
+            if len(core) < 2 or abs(x + w / 2 - 0.5) > 0.2:
+                continue
+            y0, y1 = 1 - (y + h), 1 - y               # 换成原点左上
+            hits.setdefault(round((y0 + y1) / 2 * 25), []).append((o['file'], y0, y1, x, x + w, core))
+    if not hits:
+        return None
+    # 20261018 改打分。以前数「几帧有字」，可比分栏/台标/标题卡/UI 每帧都在，天然比字幕多
+    #（1009 原神解说锁到 50–65% 的对话框、1018 LOL 锁到顶上比分栏）。现在两步：
+    # ① 剥掉数字标点后，同一串字出现在 ≥1/4 帧里的算固定文字，剔掉（比分 13vs7→vs、标题、台标）；
+    # ② 剩下的按**有字的帧数**算，不按句子数——原神那条有整屏的书页，一帧十几行每行都不同，
+    #    按句子数书页赢；但书页只出现在部分画面里，字幕几乎贯穿全片（22/24 帧）。
+    # 相邻两档合起来算（字幕高度可能正好压在档界上），帧取并集，所以多行文字叠不出分来。
+    from collections import Counter
+    seen = Counter(c for c, _ in {(p[5], p[0]) for v in hits.values() for p in v})
+    static = {c for c, k in seen.items() if k >= max(3, n // 4)}
+    wm = Counter(c for c, _ in anywhere)
+    BAND_STATIC.clear(); BAND_STATIC.update(c for c, k in wm.items() if k >= max(3, n // 4))   # 给 _strip_watermark 用
+    live = {k: [p for p in v if p[5] not in static] for k, v in hits.items()}
+
+    def frames(k):
+        return {p[0] for p in live.get(k, []) + live.get(k + 1, [])}
+    best = max(live, key=lambda k: (len(frames(k)), k))   # 平手取靠下的
+    if len(frames(best)) < max(3, n // 6):     # 不到 1/6 的帧有在变的字，多半不是字幕
+        return None
+    pts = live.get(best, []) + live.get(best + 1, [])
+    pad = 0.015
+    y0 = max(0, min(p[1] for p in pts) - pad); y1 = min(1, max(p[2] for p in pts) + pad)
+    # x 范围只给"比较"用，不给 OCR 用：抽到的那几帧字幕可能都短，按它们框宽度裁 OCR 图，
+    # 长句头尾会被切掉（实测漏 91 句）；但整条宽度拿来比，两边背景一动就切出一堆假段（OCR 86 秒）。
+    x0 = max(0, min(p[3] for p in pts) - 0.03); x1 = min(1, max(p[4] for p in pts) + 0.03)
+    return y0, y1, x0, x1
+
+
+def _strip_frames(video, tmp, fps, band):
+    """一遍解码出两路：小灰度图字节（比差异）+ 原尺寸 jpg（给 OCR）。
+    20261008 第二版：以前两遍 ffmpeg、写四千张 png；现在 split 一次解码两路输出，jpg 小得多。"""
+    y0, y1, x0, x1 = band
+    crop = f"crop=iw:ih*{y1-y0:.4f}:0:ih*{y0:.4f}"                    # OCR：整条宽度
+    mid = f"crop=iw*{x1-x0:.4f}:ih:iw*{x0:.4f}:0"                     # 比较：只看中间
+    W, H = 384, 48   # 20261008：160×24 时等长同位的两句白字缩完亮点几乎重合，被并成一句（漏 40 句）
+    d = tmp / 'strip'; d.mkdir(exist_ok=True)
+    raw = subprocess.run(['ffmpeg', '-loglevel', 'error', '-i', str(video), '-filter_complex',
+                          f'[0:v]fps={fps},{crop},split[a][b];[a]{mid},scale={W}:{H},format=gray[g]',
+                          '-map', '[g]', '-f', 'rawvideo', 'pipe:1',
+                          '-map', '[b]', '-q:v', '3', str(d / '%05d.jpg')],
+                         capture_output=True).stdout
+    n = W * H
+    sigs = [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+    pngs = sorted(d.glob('*.jpg'))
+    m = min(len(sigs), len(pngs))
+    return sigs[:m], pngs[:m], W
+
+
+# 亮点掩码：bytes.translate 把每个像素变成 0/1，再整个转成大整数——
+# 交并就是 & | 和 bit_count，全在 C 里跑。第一版逐像素 Python 循环，比较一段 23 分钟视频要几十秒。
+_BRIGHT = bytes(1 if i > 190 else 0 for i in range(256))
+
+
+def _mask(sig):
+    return int.from_bytes(sig.translate(_BRIGHT), 'big')
+
+
+def _ink(mask, n):
+    """这一条里白字占比（‰）。"""
+    return 1000 * mask.bit_count() / n
+
+
+def _changed(A, B):
+    """字有没有换：亮点的 Jaccard 距离 0–1。只比白字，背景画面动不算换句。"""
+    u = (A | B).bit_count()
+    return 0.0 if not u else 1 - (A & B).bit_count() / u
+
+
+def _fmt_ts(t, srt=True):
+    h, m, s = int(t // 3600), int(t % 3600 // 60), t % 60
+    return f'{h:02d}:{m:02d}:{s:06.3f}'.replace('.', ',') if srt else f'{h:d}:{m:02d}:{int(s):02d}'
+
+
+# 20261103 一条户外动物视频一堆单字乱码：PP 只认字不找字，没字幕的镜头里给它草地/泥/水，
+# 它也硬吐一两个字（m、一、口、Y）；有字幕时又会把字幕带两头的小人图标、半截水印认成字粘上去
+#（「中体且极度自律公」「就是味道不大对華装」）。量了 246 句：硬吐的整句把握度 <0.4；粘上去的怪字
+# 单字把握度几乎都 <0.35，句子里真字基本 >0.9。以前的视频几乎每个镜头都有字幕，所以没暴露。
+PP_EDGE_MIN = 0.3    # 句子两头单字把握度低于它就剪掉（1104 试过 0.7：麦克风「具」0.58 是剪掉了，但真字「惩罚」的「罚」、「可能」的「可」也在 0.3~0.7，误伤更多，退回）
+PP_GAP_K = 3         # 两头的字和相邻字的间距 > 中位间距×它（且 ≥6 步）就剪：背景里的东西（头发→「大」、窗框→「三」）隔着一大段空白
+PP_LINE_MIN = 0.5    # 剪完整句平均把握度低于它就整句扔掉
+
+
+def _clean_pp(text, pc, pt=None):
+    """按 PP 的单字把握度剪两头怪字、扔掉硬吐出来的整句。剩下有效字不到 2 个也扔（单个「一」「、」）。
+    pt（每个字在 CTC 时间轴上的位置≈横坐标）在的话，先按间距剪：OCR 喂的是整条宽度的字幕带，
+    短字幕两边的背景（旁听席的头发、窗框）会被认成字粘在两头，它们和正文之间隔着一大段空白。"""
+    if pt and len(pt) == len(text) == len(pc) and len(pt) >= 4:
+        items = list(zip(text, pc, pt))
+        gaps = sorted(b[2] - a[2] for a, b in zip(items, items[1:]))
+        lim = max(6, PP_GAP_K * gaps[len(gaps) // 2])
+        while len(items) > 2 and items[1][2] - items[0][2] > lim:
+            items.pop(0)
+        while len(items) > 2 and items[-1][2] - items[-2][2] > lim:
+            items.pop()
+        text = "".join(c for c, _, _ in items); pc = [p for _, p, _ in items]
+    chars = list(zip(text, pc))
+    while chars and (chars[0][1] < PP_EDGE_MIN or not chars[0][0].strip()):
+        chars.pop(0)
+    while chars and (chars[-1][1] < PP_EDGE_MIN or not chars[-1][0].strip()):
+        chars.pop()
+    if not chars or sum(p for _, p in chars) / len(chars) < PP_LINE_MIN:
+        return ''
+    # 两头孤立的标点/连字符也剪（「，、它是…」「一-再加两条」的「-」），句中的不动
+    t = re.sub(r'^[\s，、。：；,.:;\-—…·]+|[\s，、：；,:;\-—·]+$', '', ''.join(c for c, _ in chars))
+    return t if len(re.sub(r'[\W\d_]', '', t)) >= 2 else ''
+
+
+BAND_STATIC = set()   # _find_band 抽 24 帧整图时、在 ≥1/4 帧里都出现的字（水印/台标/比分栏），已剥掉数字标点
+
+
+def _strip_watermark(out):
+    """画面里飘的水印（「小鱼动物园」）偶尔进字幕带，认得还很准，单字把握度剪不掉。
+    只删 _find_band 在整图里见过的固定文字。⚠️ 别改回「字幕里重复 ≥3 次就当水印」：
+    1103 第一版这么干，在游戏解说上把「一只小小虫」「尤克里里」「这一波我们」这些口头禅删了一大片。"""
+    # 水印常被认掉头尾一个字（「小鱼动物」），所以水印的 4 字以上片段也算
+    marks = sorted({w[i:j] for w in BAND_STATIC for i in range(len(w)) for j in range(i + 4, len(w) + 1)},
+                   key=len, reverse=True)
+    res = []
+    for a, b, t in out:
+        for m in marks:
+            t = t.replace(m, '')
+        t = t.strip()
+        if len(re.sub(r'[\W\d_]', '', t)) >= 2:
+            res.append([a, b, t])
+    return res
+
+
+def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.3, engine='pp'):
+    if not VISIONOCR.exists():
+        sys.exit(f'缺 {VISIONOCR}：cd {VISIONOCR.parent} && swiftc -O visionocr.swift -o visionocr')
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        import time; T = [time.time()]
+        def lap(name): T.append(time.time()); print(f'  [{name} {T[-1]-T[-2]:.1f}s]', file=sys.stderr)
+        print('下载视频…', file=sys.stderr)
+        video = _fetch_video(url, tmp, browser); lap('下载')
+        if region:
+            band = (1 - region, 1.0, 0.0, 1.0)
+        else:
+            band = _find_band(video, tmp, _probe(video)[2] or 60)
+            if band:
+                print(f'字幕带：高度 {band[0]:.0%}–{band[1]:.0%}，宽 {band[2]:.0%}–{band[3]:.0%}', file=sys.stderr)
+            else:
+                band = (0.78, 1.0, 0.0, 1.0)
+                print('没自动找到字幕位置，按底部 22% 来（不对就 --sub-region）', file=sys.stderr)
+        lap('找位置')
+        sigs, pngs, W = _strip_frames(video, tmp, fps, band); lap('解码')
+        if not sigs:
+            print('✗ 硬字幕：没抽到帧', file=sys.stderr); return 1
+        N = len(sigs[0]); masks = [_mask(x) for x in sigs]
+        # 切段：有字的连续帧、相邻变化小的算同一句
+        segs, cur = [], None
+        for i, mk in enumerate(masks):
+            has = _ink(mk, N) >= ink_min
+            if not has:
+                if cur: segs.append(cur); cur = None
+                continue
+            if cur and _changed(masks[cur[1]], mk) < change:
+                cur[1] = i
+            else:
+                if cur: segs.append(cur)
+                cur = [i, i]
+        if cur: segs.append(cur)
+        if not segs:
+            print('✗ 硬字幕：字幕带里没看到字（位置不对？试 --sub-region 0.35 指定底部比例）', file=sys.stderr)
+            return 1
+        lap('切段')
+        mids = [pngs[(a + b) // 2] for a, b in segs]
+        print(f'{len(sigs)} 帧 → {len(segs)} 段候选，OCR 中…', file=sys.stderr)
+        texts = {}
+        use_pp = engine == 'pp' and PPOCR_PY.exists() and PPOCR.exists()
+        if engine == 'pp' and not use_pp:
+            print(f'PP-OCR 环境不在（{MODELS}，见 README「硬字幕」），退回 Vision', file=sys.stderr)
+        # 1104：PP 那条先用检测模型找字幕框再认（ppocr_rec.py --det），不再整条宽度喂识别。
+        # 检测模型不在就退回整条喂，_clean_pp 的间距剪字兜底。
+        cmd = ([str(PPOCR_PY), str(PPOCR)] + (['--det'] if PPOCR_DET.exists() else [])) if use_pp else [str(VISIONOCR)]
+        for k in range(0, len(mids), 500):
+            r = subprocess.run(cmd + [str(x) for x in mids[k:k + 500]],
+                               capture_output=True, text=True)
+            for line in r.stdout.splitlines():
+                o = json.loads(line)
+                texts[o['file']] = _clean_pp(o['text'], o['pc'], o.get('pt')) if 'pc' in o else o['text'].strip()
+        lap('OCR')
+        # 连续近似的合并（同一句被认成"的"有无两版），留最长那版；空的扔掉
+        import difflib
+        out = []
+        for (a, b), mp in zip(segs, mids):
+            t = texts.get(str(mp), '')
+            if not t: continue
+            if out and difflib.SequenceMatcher(None, out[-1][2], t).ratio() >= 0.75:
+                out[-1][1] = (b + 1) / fps
+                if len(t) > len(out[-1][2]): out[-1][2] = t
+            else:
+                out.append([a / fps, (b + 1) / fps, t])
+        out = _strip_watermark(out)
+        title = re.sub(r'[\\/:*?"<>|]', '_', video.stem)[:80]
+    ads = bili_ads(url)
+    out = [x for x in out if not _in_ads((x[0] + x[1]) / 2, ads)]
+    if not CUES:
+        CUES.extend((a, b, t) for a, b, t in out)
+    dest = outdir / f'{title}.硬字幕.{fmt}'
+    with open(dest, 'w') as f:
+        if fmt == 'srt':
+            for i, (a, b, t) in enumerate(out, 1):
+                f.write(f'{i}\n{_fmt_ts(a)} --> {_fmt_ts(b)}\n{t}\n\n')
+        else:
+            f.write('\n'.join(t for _, _, t in out) + '\n')
+    print(f'✓ 硬字幕 {len(out)} 句 → {dest}')
+    return 0
+
+
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description='\n\n'.join(__doc__.split('\n\n')[:2]),
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('url')
     p.add_argument('-l', '--lang', default=None, help='如 ai-zh / zh-CN / en')
     p.add_argument('-f', '--format', default='txt', choices=['txt', 'srt'])
@@ -835,6 +1366,13 @@ def main():
                    help='借哪个浏览器的 cookie: chrome/edge/safari/firefox/none'
                         '（B 站字幕必须登录，默认 none 在那里会拿不到）')
     p.add_argument('--list', action='store_true')
+    # 20261008：没有字幕轨 / 自动字幕听不懂方言时，读画面上烧进去的字
+    p.add_argument('-H', '--hardsub', action='store_true',
+                   help='字幕那一半改成读烧在画面里的硬字幕（自动找位置 + OCR）；帧照抓，不要加 --no-frames')
+    p.add_argument('--sub-region', type=float, default=None,
+                   help='手动指定硬字幕在画面底部多大比例里（默认自动找位置）')
+    p.add_argument('--ocr', default='pp', choices=['pp', 'vision'],
+                   help='硬字幕识别引擎：pp=PP-OCRv6 tiny（默认，快且准，只认单行）/ vision=macOS 自带（多行）')
     # ⚠️ 20260829 改默认：以前 -F 是「抓帧**且不抓字幕**」，两者互斥。
     #    暴露问题的是一条几乎没有语音的视频——只拿到六行字幕，**就以为已经看完了**，
     #    其实画面里还有一整组镜头没看见。
@@ -845,7 +1383,11 @@ def main():
                    help='只要字幕，不抓帧。纯语音的东西（播客/讲座/访谈）抓帧是白抓，还慢')
     p.add_argument('-z', '--zoom', metavar='T[,T...]',
                    help='把指定时间点抽成大图，如 -z 2:15 或 -z 2:11,2:13,2:15')
+    p.add_argument('--keep-ads', action='store_true',
+                   help='B 站默认按空降助手的标注剃掉恰饭/自推段（字幕和样片都剃）；加这个就不剃')
     a = p.parse_args()
+    global KEEP_ADS
+    KEEP_ADS = a.keep_ads
 
     outdir = Path(a.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -860,8 +1402,13 @@ def main():
             subs_hint(url, a.browser)
         return rc
 
-    handler = xiaohongshu if re.search(r'xiaohongshu\.com|xhslink', a.url) else generic
-    rc_sub = handler(a.url, a.lang, a.format, outdir, a.browser, a.list)
+    # 20261008：-H 第一版写成"不抓帧"，正好违反 0829 那条——只给一半会让人以为看完了。
+    #   -H 只是把"字幕"那一半换成读画面上的字，帧照抓；不要帧就 --no-frames。
+    if a.hardsub:
+        rc_sub = hardsubs(expand(a.url), outdir, a.browser, a.format, region=a.sub_region, engine=a.ocr)
+    else:
+        handler = xiaohongshu if re.search(r'xiaohongshu\.com|xhslink', a.url) else generic
+        rc_sub = handler(a.url, a.lang, a.format, outdir, a.browser, a.list)
     # --list 是查询动作（列有哪些字幕轨），不该顺带下一整个视频来抓帧
     if a.no_frames or a.list:
         return rc_sub

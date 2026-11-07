@@ -9,6 +9,7 @@
 watchvideo <url>              # 字幕 + 样片，一次给全   subtitles + contact sheet
 watchvideo <url> --no-frames  # 只要字幕                subtitles only
 watchvideo <url> --list       # 先看有哪些字幕轨        list available tracks
+watchvideo <url> -H           # 读烧在画面里的硬字幕    read burned-in subtitles
 ```
 
 ## 长什么样 / What it looks like
@@ -179,6 +180,8 @@ makes the detector fire repeatedly. Labels carry one decimal and extraction lead
 brew install yt-dlp ffmpeg imagemagick     # macOS
 ```
 
+要 `-H`（读硬字幕）还得装一点东西，见下面「装 -H」。*`-H` needs a little more; see "Setting up `-H`" below.*
+
 Linux 用各自的包管理器装这三个即可。把 `watchvideo.py` 放进 PATH（或做个软链）。
 
 *On Linux install the same three via your package manager. Put `watchvideo.py` on your PATH.*
@@ -195,6 +198,11 @@ watchvideo <url> -z 2:15           # 放大某个时间点        zoom into one 
 watchvideo <url> -z 2:11,2:13,2:15 # 放大多个时间点        several moments
 watchvideo <url> -o DIR            # 输出目录              output directory
 watchvideo <url> --browser chrome  # 借浏览器 cookie       borrow browser cookies
+watchvideo <url> -H                # 硬字幕 + 样片         burned-in subs + sheet
+watchvideo <url> -H -f srt         # 硬字幕带时间轴        ... with timestamps
+watchvideo <url> -H --ocr vision   # 两行字幕/多行花字     multi-line captions
+watchvideo <url> --keep-ads        # B 站不剃恰饭段        keep Bilibili sponsor segments
+watchvideo ./clip.mp4              # 本地文件也行          local files work too
 ```
 
 环境变量 `WATCHVIDEO_OUT` / `WATCHVIDEO_BROWSER` 可以省掉每次输入。
@@ -233,6 +241,70 @@ sample frames — an order of magnitude slower than fetching subtitles, plus one
 frames are worthless). `--list` and `-z` are unaffected. If one path fails but the other
 succeeds the run still exits 0; only a double failure is an error.*
 
+## 0.4：硬字幕 / Since 0.4: burned-in subtitles (`-H`)
+
+很多视频根本没有字幕轨，或者自动字幕听不懂方言——可 UP 主烧进画面的字是人听懂了打的，是准的。
+字已经在画面上，只差读出来。`-H` 把「字幕」那一半换成读画面上的字，**帧照抓**（不要帧加 `--no-frames`）。
+
+*Plenty of videos have no subtitle track, or auto-captions that can't follow a dialect — yet the
+captions burned into the picture were typed by someone who understood it. `-H` swaps the subtitle
+half for reading those on-screen captions; **frames are still sampled** (`--no-frames` to skip).*
+
+做法：先抽 24 帧找字幕在画面哪一条（找错了用 `--sub-region 0.25` 指定底部比例）→ 相邻帧比差异，
+字幕变了才算新的一句 → 每句取中间一帧 → 检测模型先框出字幕行再识别 → 连续相同的合并。
+画面里固定不动的字（台标、水印）会被认出来剔掉；句子两头粘上的背景字按单字把握度和字间距剪掉。
+23 分钟的视频大约 20 秒。
+
+*How: sample 24 frames to locate the caption band (override with `--sub-region 0.25`) → diff
+adjacent frames so only a changed caption counts as a new line → OCR one frame per line, detecting
+the text box first → merge repeats. Static text (logos, watermarks) is dropped; stray background
+glyphs stuck to either end are trimmed by per-character confidence and spacing. ~20 s for 23 minutes.*
+
+两个识别引擎：
+
+- **PP-OCRv6 tiny**（默认，[Apache 2.0](https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_rec_onnx)）：
+  识别 4.4MB + 检测 1.8MB，快且准，**只认单行**。实测 69 句 1.6s，Vision 要 4.4s。
+- **macOS Vision**（`--ocr vision`）：系统自带，认多行，但**系统性吞「的」**
+  （「心心念念的老秦人的坟头」→「心心念念老秦人坟头」）。两行字幕、多行花字时用它。
+
+*Two engines: **PP-OCRv6 tiny** (default; 4.4 MB recogniser + 1.8 MB detector, fast and accurate,
+**single line only**) and **macOS Vision** (`--ocr vision`; built in, handles multiple lines, but
+systematically drops the particle 的). Locating the caption band always uses Vision, so `-H` is macOS-only.*
+
+### 装 -H / Setting up `-H`
+
+```bash
+# 1. Vision 小工具（找字幕位置要用，必装）   the Vision helper (required)
+cd /path/to/watchvideo && swiftc -O visionocr.swift -o visionocr
+
+# 2. PP-OCR（可选；没装会自动退回 Vision）   PP-OCR (optional; falls back to Vision)
+M=${WATCHVIDEO_MODELS:-~/.cache/watchvideo/models}
+python3 -m venv $M/.venv && $M/.venv/bin/pip install onnxruntime numpy pillow pyyaml
+for r in rec det; do
+  hf download PaddlePaddle/PP-OCRv6_tiny_${r}_onnx inference.onnx inference.yml --local-dir $M/ppocrv6_tiny_$r
+done
+```
+
+模型目录默认 `~/.cache/watchvideo/models`，`WATCHVIDEO_MODELS` 可以改。
+没有 `hf` 命令就 `pip install huggingface_hub`，或者去模型页手动下那两个文件。
+
+*Models live in `~/.cache/watchvideo/models` unless `WATCHVIDEO_MODELS` says otherwise. No `hf`?
+`pip install huggingface_hub`, or grab the two files from the model pages by hand.*
+
+## 0.4：样片更会挑格 / Since 0.4: smarter contact sheets
+
+- **每格印台词**：格子下面印那一刻的字幕（硬字幕也算），样片后再打一份「格子台词」文字版。
+  画面和台词对上了，不用再拿时间戳去字幕里翻。
+- **字幕在指画面时强制抽一帧**：说到「请看」「这张图」「右上角」「look at…」，那一刻一定有一格（标 ★），删格时不删。
+- **画面突变进候选**：口播 + 不停弹截图的视频，背景从头到尾不换，镜头检测只认出一个镜头。
+  现在每 0.5 秒比一次缩略图，突然变了一大块（截图弹出、换页）就进候选。实测一条这样的视频，有截图的格 9 → 12。
+- **删格先删最像的**：格数超了，不再均匀删，一张张删「跟留下的最像的那张」——同一个大头复读六遍的先走。
+
+*Each cell now carries the line being spoken at that moment (plus a text version after the sheet);
+a line that points at the picture ("look at…", "top right") forces a frame (★); sudden on-screen
+changes (a screenshot popping up over a talking head) become candidates even when scene detection
+sees one long shot; and when trimming, the cell most similar to what's kept goes first.*
+
 ## 站点 / Sites
 
 样片对 yt-dlp 支持的站点通用；字幕除小红书外也走 yt-dlp。实测过 B 站、小红书、YouTube、X。
@@ -247,6 +319,15 @@ for Xiaohongshu. Tested on Bilibili, Xiaohongshu, YouTube and X.*
   ***Bilibili*** *AI subtitles require login (`--browser`). Wait a few seconds after logging
   in: Chromium writes cookies to disk lazily, and until it does you get the stale session
   plus a badly misleading `Subtitles are only available when logged in`.*
+
+- **B 站去广告**（20261018）：默认按 [BilibiliSponsorBlock](https://www.bsbsb.top)（「B站空降助手」的社区标注库）
+  剃掉恰饭（`sponsor`）和自推（`selfpromo`）段——字幕里落在段内的句子删掉，样片在剃掉广告后的正片时间轴上均匀取格，
+  标签仍是原片时刻（`-z` 照用）。片头片尾、三连提醒不剃。运行时会打一行剃了哪几段；**没人标过会明说「没剃」**，
+  不代表没广告。不想剃加 `--keep-ads`。
+
+  ***Bilibili ad skipping***: *sponsor and self-promo segments from BilibiliSponsorBlock's community
+  database are cut from subtitles and contact sheets by default (labels keep original timestamps).
+  Unlabelled videos are reported as such. `--keep-ads` to disable.*
 
 - **YouTube** 的自动字幕里，真 ASR 那条标成 `<lang>-orig`，其余一两百条都是机翻。
   不指定语种时默认只取原生轨，不然会一次落下一百多个文件。
