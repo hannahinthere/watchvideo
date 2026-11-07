@@ -1271,14 +1271,26 @@ def _strip_watermark(out):
     return res
 
 
+TEXT_H = {}   # 认出来的字 → 字幕框高（像素），给 _drop_foreign 判字号；Vision 那条没有框，查不到就不删
+
+
 def _drop_foreign(out):
-    """中文字幕的片子里，一个汉字都没有的句子是画面上的英文（文档、论文列表、台标），不是字幕。1107 加：
-    lindsay 1411 句里 26 句全是这种（ucnornis×8、Selected Publications…），另三条 B 站片子 0~2 句，一句真字幕都没有。
-    九成以上的句子带汉字才动手，英文字幕的片子不受影响。"""
+    """中文字幕的片子里，零汉字、而且字号跟字幕对不上的句子是画面上的英文（文档、论文列表、台标），扔掉。
+    1107 第一版只看「零汉字」，她指出：字幕里单独打一句英文原句引用就会被误删。改成再看字号——
+    同一条片子字幕字高很稳（lindsay 有汉字的句子框高 35~40px，中位 37），画面文字差得远：
+    零汉字的 60 条里只有 3 条落在 0.8~1.25 倍（Patrick Clancy Donations / MISTRIAL / 一条乱码），留着，换英文引用不被误删。
+    九成以上的句子带汉字才动手；英文字幕的片子不受影响。"""
     cjk = lambda t: re.search(r'[\u4e00-\u9fff]', t)
     if not out or sum(1 for x in out if cjk(x[2])) < 0.9 * len(out):
         return out
-    return [x for x in out if cjk(x[2])]
+    hs = sorted(TEXT_H[x[2]] for x in out if cjk(x[2]) and x[2] in TEXT_H)
+    if len(hs) < 10:
+        return out
+    med = hs[len(hs) // 2]
+    def keep(x):
+        h = TEXT_H.get(x[2])
+        return cjk(x[2]) or h is None or 0.8 * med <= h <= 1.25 * med
+    return [x for x in out if keep(x)]
 
 
 LONG_SEG_S = 4.0    # 一段超过这么久多半是几句被并成一段了（见 _units）
@@ -1356,6 +1368,8 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
             for line in r.stdout.splitlines():
                 o = json.loads(line)
                 texts[o['file']] = _clean_pp(o['text'], o['pc'], o.get('pt')) if 'pc' in o else o['text'].strip()
+                if o.get('box'):
+                    TEXT_H[texts[o['file']]] = o['box'][3] - o['box'][1]
         lap('OCR')
         # 连续近似的合并（同一句被认成"的"有无两版），留最长那版；空的扔掉
         import difflib
