@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PP-OCRv6 tiny 识别（只认字、不找字），给 watchvideo -H 做对照实验（20261008）。
-    $WATCHVIDEO_MODELS/.venv/bin/python ppocr_rec.py [--det] a.jpg b.jpg ...   → 每张一行 JSON {"file","text","conf","pc"}
+    $MODELS/.venv/bin/python ppocr_rec.py [--det] a.jpg b.jpg ...   → 每张一行 JSON {"file","text","conf","pc"}
+    $MODELS/.venv/bin/python ppocr_rec.py --boxes a.jpg ...          → 同 visionocr --boxes（找字幕带用，1107）
     pc = 每个字的把握度（1103 加：watchvideo 拿它剪掉句子两头粘上的怪字）
     pt = 每个字在 CTC 时间轴上的位置（1104 加：≈横坐标，字幕两头隔着大空当的字是背景里的东西）
 预处理照 PaddleOCR RecResizeImg：高 48，按比例缩宽，(x/255-0.5)/0.5，BGR，CHW。后处理 CTC：
@@ -89,16 +90,8 @@ def _components(m):
     return list(agg.values())
 
 
-def subtitle_box(im, thr=0.3):
-    w, h = im.size
-    cs = [c for c in _components(_prob(im) > thr) if c[4] >= 20]
-    if not cs:
-        return None
-    cx = w / 2
-    cross = [c for c in cs if c[0] <= cx <= c[2]]
-    # 种子：横跨中线的块里字最高的（字幕字号通常比画面里的文档/招牌大）；没有横跨的就取离中线最近的
-    seed = max(cross, key=lambda c: (c[3] - c[1], c[4])) if cross else \
-        min(cs, key=lambda c: min(abs(c[0] - cx), abs(c[2] - cx)))
+def _grow(seed, cs):
+    """从种子块出发，把同一行相邻的块并进来，返回这一行的块。"""
     hh = seed[3] - seed[1]
     line, changed = [seed], True
     while changed:
@@ -114,10 +107,59 @@ def subtitle_box(im, thr=0.3):
             gap = max(c[0] - x1, x0 - c[2])
             if gap < 1.2 * hh and ch <= 1.6 * hh and (inside or ov >= 0.5 * min(y1 - y0, ch)):
                 line.append(c); changed = True
+    return line
+
+
+def _expand(line, w, h, ey=0.5):
+    """DB 预测的是缩进去的核，外扩回字的实际大小。ey = 竖直方向外扩几成 e（识别用 0.5 够了；找字幕带要整字高，见 text_lines）。"""
     x0 = min(c[0] for c in line); x1 = max(c[2] for c in line)
     y0 = min(c[1] for c in line); y1 = max(c[3] for c in line)
     e = int(0.6 * (y1 - y0)) + 2
-    return [int(max(0, x0 - e)), int(max(0, y0 - e // 2)), int(min(w, x1 + e)), int(min(h, y1 + e // 2))]
+    return [int(max(0, x0 - e)), int(max(0, y0 - e * ey)), int(min(w, x1 + e)), int(min(h, y1 + e * ey))]
+
+
+def subtitle_box(im, thr=0.3):
+    w, h = im.size
+    cs = [c for c in _components(_prob(im) > thr) if c[4] >= 20]
+    if not cs:
+        return None
+    cx = w / 2
+    cross = [c for c in cs if c[0] <= cx <= c[2]]
+    # 种子：横跨中线的块里字最高的（字幕字号通常比画面里的文档/招牌大）；没有横跨的就取离中线最近的
+    seed = max(cross, key=lambda c: (c[3] - c[1], c[4])) if cross else \
+        min(cs, key=lambda c: min(abs(c[0] - cx), abs(c[2] - cx)))
+    return _expand(_grow(seed, cs), w, h)
+
+
+def text_lines(im, thr=0.3, ey=0.5):
+    """整张图里所有的文字行（1107 加，给 watchvideo 找字幕带用，替掉 Vision）：字最高的块先当种子长成一行，拿走，再挑下一个。"""
+    w, h = im.size
+    left = sorted((c for c in _components(_prob(im) > thr) if c[4] >= 20), key=lambda c: -(c[3] - c[1]))
+    out = []
+    while left:
+        line = _grow(left[0], left)
+        left = [c for c in left if c not in line]
+        out.append(_expand(line, w, h, ey))
+    return out
+
+
+# 1107 量的：0.5 时字幕带比 Vision 窄 ~2%；1.0 在 5 条视频上跟 Vision 差 ≤1%。lindsay 对 pickcut 字错率 1.0/1.5/2.0 = 10.8/10.2/12.4%，
+#   但把 Vision 的带只挪 1% 就在 9.9~11.3% 之间晃——噪声比引擎差大，按几何最贴 Vision 的取 1.0。
+EY = 1.0
+if "--boxes" in sys.argv[1:]:
+    # 同 visionocr --boxes：每张一行 {"file", "boxes": [[x, y, w, h, "字"], …]}，坐标 0–1、原点左下（照 Vision 的习惯，watchvideo 那边不用改）
+    for f in [a for a in sys.argv[1:] if not a.startswith("--")]:
+        im = Image.open(f).convert("RGB")
+        W, H = im.size
+        bx = []
+        for x0, y0, x1, y1 in text_lines(im, ey=EY):
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            t = decode(sess.run(None, {inp: prep(im.crop((x0, y0, x1, y1)))})[0][0])[0]
+            if t.strip():
+                bx.append([x0 / W, 1 - y1 / H, (x1 - x0) / W, (y1 - y0) / H, t])
+        print(json.dumps({"file": f, "boxes": bx}, ensure_ascii=False), flush=True)
+    sys.exit(0)
 
 
 use_det = "--det" in sys.argv[1:] and DET.exists()

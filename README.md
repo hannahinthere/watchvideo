@@ -267,22 +267,25 @@ glyphs stuck to either end are trimmed by per-character confidence and spacing. 
 - **macOS Vision**（`--ocr vision`）：系统自带，认多行，但**系统性吞「的」**
   （「心心念念的老秦人的坟头」→「心心念念老秦人坟头」）。两行字幕、多行花字时用它。
 
+找字幕位置也用同一个引擎：装了 PP-OCR，`-H` 在哪儿都能跑；Vision 只有 macOS 有。
+
 *Two engines: **PP-OCRv6 tiny** (default; 4.4 MB recogniser + 1.8 MB detector, fast and accurate,
 **single line only**) and **macOS Vision** (`--ocr vision`; built in, handles multiple lines, but
-systematically drops the particle 的). Locating the caption band always uses Vision, so `-H` is macOS-only.*
+systematically drops the particle 的). Locating the caption band uses the same engine, so with PP-OCR
+installed `-H` runs anywhere; Vision is macOS-only.*
 
 ### 装 -H / Setting up `-H`
 
 ```bash
-# 1. Vision 小工具（找字幕位置要用，必装）   the Vision helper (required)
-cd /path/to/watchvideo && swiftc -O visionocr.swift -o visionocr
-
-# 2. PP-OCR（可选；没装会自动退回 Vision）   PP-OCR (optional; falls back to Vision)
+# 1. PP-OCR（推荐；任何系统）                PP-OCR (recommended; any OS)
 M=${WATCHVIDEO_MODELS:-~/.cache/watchvideo/models}
 python3 -m venv $M/.venv && $M/.venv/bin/pip install onnxruntime numpy pillow pyyaml
 for r in rec det; do
   hf download PaddlePaddle/PP-OCRv6_tiny_${r}_onnx inference.onnx inference.yml --local-dir $M/ppocrv6_tiny_$r
 done
+
+# 2. Vision 小工具（macOS；要 --ocr vision，或者没装 PP 时的后备）   the Vision helper (macOS; for --ocr vision or as fallback)
+cd /path/to/watchvideo && swiftc -O visionocr.swift -o visionocr
 ```
 
 模型目录默认 `~/.cache/watchvideo/models`，`WATCHVIDEO_MODELS` 可以改。

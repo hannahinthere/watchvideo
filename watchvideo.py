@@ -1118,7 +1118,7 @@ PPOCR = Path(__file__).resolve().parent / 'ppocr_rec.py'
 PPOCR_DET = MODELS / 'ppocrv6_tiny_det/inference.onnx'
 
 
-def _find_band(video, tmp, dur, n=24):
+def _find_band(video, tmp, dur, n=24, pp=True):
     """先找字幕在哪（pickcut 也是这么干的：先框位置，再只认那一条）。
     均匀抽 n 帧整图 → Vision 找框 → 只留水平居中的框（排除角落水印/台标）→
     按框的垂直中线分桶，剔掉固定文字后有字帧数最多的那一档就是字幕带。返回 (y0, y1, x0, x1)，0–1，原点左上；找不到 None。"""
@@ -1127,8 +1127,10 @@ def _find_band(video, tmp, dur, n=24):
         t = dur * (k + 0.5) / n
         subprocess.run(['ffmpeg', '-loglevel', 'error', '-ss', f'{t:.2f}', '-i', str(video),
                         '-frames:v', '1', '-vf', 'scale=960:-2', str(d / f'{k:02d}.jpg')], check=False)
-    r = subprocess.run([str(VISIONOCR), '--boxes'] + [str(x) for x in sorted(d.glob('*.jpg'))],
-                       capture_output=True, text=True)
+    # 1107：找框跟着认字的引擎走——PP 装着就用 PP 的检测+识别（ppocr_rec.py --boxes，输出格式同 visionocr），
+    #   不再非得有 Vision；-H 因此不再只能在 macOS 上跑。
+    cmd = [str(PPOCR_PY), str(PPOCR), '--boxes'] if pp else [str(VISIONOCR), '--boxes']
+    r = subprocess.run(cmd + [str(x) for x in sorted(d.glob('*.jpg'))], capture_output=True, text=True)
     hits = {}   # 桶 → [(帧, y0, y1, x0, x1, 去掉数字标点后的字)]
     anywhere = set()   # (字, 帧)，不管在画面哪儿——水印多半在角落，居中过滤会把它漏掉（比如角落里的频道名）
     for line in r.stdout.splitlines():
@@ -1270,8 +1272,12 @@ def _strip_watermark(out):
 
 
 def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.3, engine='pp'):
-    if not VISIONOCR.exists():
-        sys.exit(f'缺 {VISIONOCR}：cd {VISIONOCR.parent} && swiftc -O visionocr.swift -o visionocr')
+    use_pp = engine == 'pp' and PPOCR_PY.exists() and PPOCR.exists() and PPOCR_DET.exists()
+    if engine == 'pp' and not use_pp:
+        print(f'PP-OCR 环境不全（{MODELS}，见 README「装 -H」），退回 Vision', file=sys.stderr)
+    if not use_pp and not VISIONOCR.exists():
+        sys.exit(f'缺 {VISIONOCR}：cd {VISIONOCR.parent} && swiftc -O visionocr.swift -o visionocr'
+                 f'（或者装 PP-OCR，见 README「装 -H」）')
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         import time; T = [time.time()]
@@ -1281,7 +1287,7 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
         if region:
             band = (1 - region, 1.0, 0.0, 1.0)
         else:
-            band = _find_band(video, tmp, _probe(video)[2] or 60)
+            band = _find_band(video, tmp, _probe(video)[2] or 60, pp=use_pp)
             if band:
                 print(f'字幕带：高度 {band[0]:.0%}–{band[1]:.0%}，宽 {band[2]:.0%}–{band[3]:.0%}', file=sys.stderr)
             else:
@@ -1312,12 +1318,9 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
         mids = [pngs[(a + b) // 2] for a, b in segs]
         print(f'{len(sigs)} 帧 → {len(segs)} 段候选，OCR 中…', file=sys.stderr)
         texts = {}
-        use_pp = engine == 'pp' and PPOCR_PY.exists() and PPOCR.exists()
-        if engine == 'pp' and not use_pp:
-            print(f'PP-OCR 环境不在（{MODELS}，见 README「硬字幕」），退回 Vision', file=sys.stderr)
         # 1104：PP 那条先用检测模型找字幕框再认（ppocr_rec.py --det），不再整条宽度喂识别。
-        # 检测模型不在就退回整条喂，_clean_pp 的间距剪字兜底。
-        cmd = ([str(PPOCR_PY), str(PPOCR)] + (['--det'] if PPOCR_DET.exists() else [])) if use_pp else [str(VISIONOCR)]
+        # （1107 起检测模型缺了就整个退回 Vision，不再「整条喂识别」那条半残的路。）
+        cmd = [str(PPOCR_PY), str(PPOCR), '--det'] if use_pp else [str(VISIONOCR)]   # 1107：检测模型现在是 PP 的必备件（找位置也靠它）
         for k in range(0, len(mids), 500):
             r = subprocess.run(cmd + [str(x) for x in mids[k:k + 500]],
                                capture_output=True, text=True)
