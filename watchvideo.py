@@ -1271,6 +1271,34 @@ def _strip_watermark(out):
     return res
 
 
+def _drop_foreign(out):
+    """中文字幕的片子里，一个汉字都没有的句子是画面上的英文（文档、论文列表、台标），不是字幕。1107 加：
+    lindsay 1411 句里 26 句全是这种（ucnornis×8、Selected Publications…），另三条 B 站片子 0~2 句，一句真字幕都没有。
+    九成以上的句子带汉字才动手，英文字幕的片子不受影响。"""
+    cjk = lambda t: re.search(r'[\u4e00-\u9fff]', t)
+    if not out or sum(1 for x in out if cjk(x[2])) < 0.9 * len(out):
+        return out
+    return [x for x in out if cjk(x[2])]
+
+
+LONG_SEG_S = 4.0    # 一段超过这么久多半是几句被并成一段了（见 _units）
+SUB_EVERY_S = 1.2   # 长段里每隔多久多认一帧
+
+
+def _units(a, b, fps):
+    """一段 [a, b] 帧拆成要认的单元 [(起帧, 止帧, 认哪一帧)]。
+    1107：亮背景（浅色画面、白底文档、白墙）上，「亮点」大半是背景，换一句字幕只动其中一小块，
+    _changed 判成没换句，几句并成一段、只认中间一帧——lindsay 4:42 一段 6 秒吞了三句，13 句漏认里 8 句是这样。
+    一句字幕一般 2~3 秒，超过 LONG_SEG_S 的段每隔 SUB_EVERY_S 多认一帧；认出来一样的，后面连续合并会并掉。"""
+    n = b - a + 1
+    if n <= LONG_SEG_S * fps:
+        return [(a, b, (a + b) // 2)]
+    step = max(1, int(SUB_EVERY_S * fps))
+    mids = list(range(a + step // 2, b + 1, step))
+    edges = [a] + [(x + y) // 2 for x, y in zip(mids, mids[1:])] + [b + 1]
+    return [(edges[i], edges[i + 1] - 1, m) for i, m in enumerate(mids)]
+
+
 def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.3, engine='pp'):
     use_pp = engine == 'pp' and PPOCR_PY.exists() and PPOCR.exists() and PPOCR_DET.exists()
     if engine == 'pp' and not use_pp:
@@ -1315,8 +1343,9 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
             print('✗ 硬字幕：字幕带里没看到字（位置不对？试 --sub-region 0.35 指定底部比例）', file=sys.stderr)
             return 1
         lap('切段')
-        mids = [pngs[(a + b) // 2] for a, b in segs]
-        print(f'{len(sigs)} 帧 → {len(segs)} 段候选，OCR 中…', file=sys.stderr)
+        units = [u for a, b in segs for u in _units(a, b, fps)]
+        mids = [pngs[m] for _, _, m in units]
+        print(f'{len(sigs)} 帧 → {len(segs)} 段候选（长段拆开共认 {len(units)} 帧），OCR 中…', file=sys.stderr)
         texts = {}
         # 1104：PP 那条先用检测模型找字幕框再认（ppocr_rec.py --det），不再整条宽度喂识别。
         # （1107 起检测模型缺了就整个退回 Vision，不再「整条喂识别」那条半残的路。）
@@ -1331,7 +1360,7 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
         # 连续近似的合并（同一句被认成"的"有无两版），留最长那版；空的扔掉
         import difflib
         out = []
-        for (a, b), mp in zip(segs, mids):
+        for (a, b, _), mp in zip(units, mids):
             t = texts.get(str(mp), '')
             if not t: continue
             if out and difflib.SequenceMatcher(None, out[-1][2], t).ratio() >= 0.75:
@@ -1340,6 +1369,7 @@ def hardsubs(url, outdir, browser, fmt, fps=3, region=None, ink_min=3, change=0.
             else:
                 out.append([a / fps, (b + 1) / fps, t])
         out = _strip_watermark(out)
+        out = _drop_foreign(out)
         title = re.sub(r'[\\/:*?"<>|]', '_', video.stem)[:80]
     ads = bili_ads(url)
     out = [x for x in out if not _in_ads((x[0] + x[1]) / 2, ads)]
